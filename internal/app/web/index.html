@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OVPN → SOCKS</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body><header><div class="brand">◈ <span>OVPN <b>→</b> SOCKS</span></div><span class="badge">用户态 · gVisor</span></header>
+<main><div class="heading"><div><p class="eyebrow">YOUR PRIVATE NETWORKS, ONE PLACE</p><h1>连接 VPN，按需代理。</h1><p class="muted">每个 OpenVPN 连接独享 SOCKS5 与用户态网络栈。系统网卡、路由和 DNS 无需改变。</p></div><button id="add" class="primary">＋ 新建连接</button></div>
+<div id="notice" role="status" hidden></div><section id="profiles" class="profiles" aria-live="polite"></section>
+<section class="help"><strong>如何使用</strong><p>导入或粘贴包含证书的 .ovpn，填写账户信息后启动。将应用的 SOCKS5 代理指向对应端口；域名解析也走 VPN。下发的路由可直接复制，用于配置你自己的 tun2socks 等工具。</p><p>默认端口从 <code>127.0.0.1:1080</code> 开始分配。当前支持 SOCKS5 TCP CONNECT，暂不支持 UDP ASSOCIATE。未连接时不会转发流量。</p></section>
+<footer>OpenVPN protocol → gVisor netstack → SOCKS5 <span>本机管理 · 加密存储 · 默认自动重连</span></footer></main>
+<dialog id="editor"><form id="profileForm"><div class="dialog-title"><h2 id="editorTitle">新建连接</h2><button type="button" id="closeEditor" class="icon" aria-label="关闭">×</button></div><input type="hidden" name="id">
+<label>连接名称<input name="name" required maxlength="100" placeholder="例如：办公网络"></label>
+<div class="row"><label>用户名<input name="username" autocomplete="off" placeholder="VPN 用户名"></label><label>密码<input name="password" type="password" autocomplete="new-password" placeholder="登录密码（不含动态码）"></label></div>
+<div class="row"><label>TOTP seed / otpauth 链接<input name="totp_seed" type="password" autocomplete="new-password" placeholder="Google Authenticator 的 Base32 seed"></label><label>认证方式<select name="totp_mode"><option value="">仅密码</option><option value="append">密码 + 动态验证码</option><option value="code">仅动态验证码</option></select></label></div>
+<p id="secretHint" class="hint">每次认证自动生成新的验证码，支持带 = 填充的 seed。</p><div id="clearSecrets" class="checks" hidden><label><input type="checkbox" name="clear_password">清除已保存密码</label><label><input type="checkbox" name="clear_totp">清除已保存 seed</label></div>
+<div class="ovpn-label"><label for="ovpn">OVPN 配置</label><label class="file-button">导入 .ovpn<input id="file" type="file" accept=".ovpn,.conf,text/plain"></label></div><textarea id="ovpn" name="ovpn" required spellcheck="false" rows="10" placeholder="粘贴 .ovpn 内容，或点击上方导入。证书和密钥请用 <ca> / <cert> / <key> 内联。"></textarea>
+<div class="row"><label>SOCKS5 地址<input name="listen" placeholder="留空自动分配，从 127.0.0.1:1080 开始"></label><div class="checks vertical"><label><input type="checkbox" name="auto_reconnect" checked>断线自动重连</label><label><input type="checkbox" name="auto_connect">程序启动时自动连接</label></div></div>
+<p class="hint">配置、密码和 seed 加密保存在本机。支持 IPv4 / IPv6 loopback 监听；无需管理员权限或 TAP/TUN 驱动。</p><p id="formError" class="error" hidden></p><div class="actions"><button type="button" id="cancelEditor">取消</button><button type="submit" class="primary">保存连接</button></div></form></dialog>
+<dialog id="details"><div class="dialog-title"><h2 id="detailTitle">连接详情</h2><button id="closeDetails" class="icon" aria-label="关闭">×</button></div><h3>服务端下发路由</h3><p class="hint">这些网段只用于显示，不会添加到系统路由。可复制给其它代理工具。</p><pre id="routes"></pre><button id="copyRoutes">复制网段</button><h3>VPN DNS / 隧道地址</h3><pre id="dns"></pre><h3>连接日志</h3><pre id="logs" class="logs"></pre></dialog>
+</body></html>

@@ -1,0 +1,87 @@
+name: Test and build
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          cache: true
+      - run: go test -count=1 ./...
+      - run: go vet ./...
+      - name: Test upstream credential callback patch
+        working-directory: third_party/sing-openvpn
+        run: go test -count=1 ./...
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          cache: true
+      - name: Install reference OpenVPN server
+        run: sudo apt-get update && sudo apt-get install -y openvpn iproute2
+      - name: Prepare test dependencies
+        run: go test -run '^$' ./internal/vpn
+      - name: Real OpenVPN server to userspace client to SOCKS
+        run: sudo --preserve-env=PATH,HOME,GOPATH,GOCACHE env OVPN_INTEGRATION=1 go test -count=1 -timeout 5m -v ./internal/vpn
+  build:
+    needs: [test, integration]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.5'
+          cache: true
+      - name: Build portable binaries
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p dist
+          VERSION="${GITHUB_REF_NAME}-${GITHUB_SHA::7}"
+          for TARGET in windows/amd64 windows/arm64 linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            OS="${TARGET%/*}"
+            ARCH="${TARGET#*/}"
+            NAME="ovpn-socks-${OS}-${ARCH}"
+            EXT=""
+            if [ "$OS" = windows ]; then EXT=".exe"; fi
+            GOOS="$OS" GOARCH="$ARCH" go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o "dist/${NAME}${EXT}" ./cmd/ovpn-socks
+          done
+          cp README.md LICENSE THIRD_PARTY.md dist/
+          cd dist && sha256sum ovpn-socks-* > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ovpn-socks-portable
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ovpn-socks-portable
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --generate-notes --title "$GITHUB_REF_NAME"

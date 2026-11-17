@@ -1,0 +1,16 @@
+/dist/
+/.local/
+/.verify/
+/.gotmp/
+/.gocache/
+*.exe
+*.test
+*.test.exe
+*.ovpn
+*.key
+profiles.enc
+master.key
+coverage.out
+/internal/proxy/.gotmp/
+/internal/config/.gotmp/
+/internal/config/.gocache/

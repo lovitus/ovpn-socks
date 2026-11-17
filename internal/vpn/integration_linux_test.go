@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -61,6 +62,14 @@ func (b *lockedOutput) String() string {
 }
 func testOfficialOpenVPN(t *testing.T, binary, mode string) {
 	dir := t.TempDir()
+	// Independent address spaces prevent fixture routes and TCP state from
+	// affecting the following control-channel scenario.
+	subnetOctet := byte(77)
+	if mode == "tls-crypt" {
+		subnetOctet = 78
+	}
+	vpnPrefix := fmt.Sprintf("10.203.%d.", subnetOctet)
+	vpnServerIP := vpnPrefix + "1"
 	ca, serverCert, serverKey, clientCert, clientKey := testCertificates(t)
 	write := func(name, content string) string {
 		path := filepath.Join(dir, name)
@@ -97,25 +106,34 @@ func testOfficialOpenVPN(t *testing.T, binary, mode string) {
 	if mode == "tls-auth" {
 		controlServer += " 0"
 	}
-	config := fmt.Sprintf("local 127.0.0.1\nport %d\nproto udp\ndev %s\ndev-type tun\ntopology subnet\nserver 10.203.77.0 255.255.255.0\nca %s\ncert %s\nkey %s\ndh none\n%s\ndata-ciphers AES-256-GCM\ncipher AES-256-GCM\nauth SHA256\ntls-version-min 1.2\nkeepalive 2 10\npush \"route 10.42.0.0 255.255.0.0\"\npush \"route-ipv6 2001:db8:42::/64\"\npush \"dhcp-option DNS 10.203.77.1\"\nverb 3\n", port, dev, caPath, serverCertPath, serverKeyPath, controlServer)
+	config := fmt.Sprintf("local 127.0.0.1\nport %d\nproto udp\ndev %s\ndev-type tun\ntopology subnet\nserver 10.203.%d.0 255.255.255.0\nca %s\ncert %s\nkey %s\ndh none\n%s\ndata-ciphers AES-256-GCM\ncipher AES-256-GCM\nauth SHA256\ntls-version-min 1.2\nkeepalive 2 10\npush \"route 10.42.0.0 255.255.0.0\"\npush \"route-ipv6 2001:db8:42::/64\"\npush \"dhcp-option DNS %s\"\nverb 4\n", port, dev, subnetOctet, caPath, serverCertPath, serverKeyPath, controlServer, vpnServerIP)
 	confPath := write("server.ovpn", config)
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
 	cmd := exec.CommandContext(ctx, binary, "--config", confPath)
+	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	cmd.WaitDelay = 3 * time.Second
 	output := &lockedOutput{}
 	cmd.Stdout = output
 	cmd.Stderr = output
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	serverDone := make(chan error, 1)
-	go func() { serverDone <- cmd.Wait() }()
+	serverDone := make(chan struct{})
+	var serverError error
+	go func() { serverError = cmd.Wait(); close(serverDone) }()
 	t.Cleanup(func() {
-		cancel()
+		// SIGTERM allows OpenVPN to remove its own interface/routes before
+		// the next subtest. Wait also reaps the process on every failure path.
+		_ = cmd.Process.Signal(syscall.SIGTERM)
 		select {
 		case <-serverDone:
 		case <-time.After(5 * time.Second):
-			cmd.Process.Kill()
+			_ = cmd.Process.Kill()
+			<-serverDone
+		}
+		cancel()
+		if t.Failed() {
+			t.Logf("official OpenVPN server (%s, %s) exit=%v:\n%s", mode, dev, serverError, output.String())
 		}
 	})
 	deadline := time.NewTimer(8 * time.Second)
@@ -124,19 +142,19 @@ func testOfficialOpenVPN(t *testing.T, binary, mode string) {
 	defer tick.Stop()
 	for !strings.Contains(output.String(), "Initialization Sequence Completed") {
 		select {
-		case err := <-serverDone:
-			t.Fatalf("server exited: %v\n%s", err, output.String())
+		case <-serverDone:
+			t.Fatalf("server exited: %v\n%s", serverError, output.String())
 		case <-deadline.C:
 			t.Fatalf("server did not initialize: %s", output.String())
 		case <-tick.C:
 		}
 	}
-	listener, err := net.Listen("tcp4", "10.203.77.1:0")
+	listener, err := net.Listen("tcp4", net.JoinHostPort(vpnServerIP, "0"))
 	if err != nil {
 		t.Fatalf("server tunnel not configured: %v\n%s", err, output.String())
 	}
 	httpServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.RemoteAddr, "10.203.77.") {
+		if !strings.HasPrefix(r.RemoteAddr, vpnPrefix) {
 			t.Errorf("HTTP arrived outside VPN: %s", r.RemoteAddr)
 		}
 		io.WriteString(w, "official-openvpn-userspace-ok")
@@ -167,7 +185,7 @@ func testOfficialOpenVPN(t *testing.T, binary, mode string) {
 	if !strings.Contains(strings.Join(snapshot.Routes, "\n"), "10.42.0.0/16") || !strings.Contains(strings.Join(snapshot.Routes, "\n"), "2001:db8:42::/64") {
 		t.Fatalf("pushed routes missing: %+v", snapshot)
 	}
-	if len(snapshot.DNS) != 1 || snapshot.DNS[0] != "10.203.77.1" {
+	if len(snapshot.DNS) != 1 || snapshot.DNS[0] != vpnServerIP {
 		t.Fatalf("DNS: %v", snapshot.DNS)
 	}
 	address := listener.Addr().(*net.TCPAddr)
@@ -182,7 +200,7 @@ func testOfficialOpenVPN(t *testing.T, binary, mode string) {
 	if _, err = io.ReadFull(conn, reply); err != nil || reply[1] != 0 {
 		t.Fatalf("SOCKS greeting: %x %v", reply, err)
 	}
-	request := []byte{5, 1, 0, 1, 10, 203, 77, 1, byte(address.Port >> 8), byte(address.Port)}
+	request := []byte{5, 1, 0, 1, 10, 203, subnetOctet, 1, byte(address.Port >> 8), byte(address.Port)}
 	conn.Write(request)
 	reply = make([]byte, 10)
 	if _, err = io.ReadFull(conn, reply); err != nil || reply[1] != 0 {

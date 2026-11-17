@@ -30,7 +30,7 @@ chmod +x ovpn-socks-linux-amd64
 -data-dir PATH           本机加密配置目录
 -no-browser              不自动打开浏览器
 -version                 版本与平台
--import PATH             从本机 JSON 文件导入配置到加密存储后退出
+-import PATH             从本机 JSON 文件导入配置到加密存储后退出（- 表示标准输入）
 ```
 
 ## 使用

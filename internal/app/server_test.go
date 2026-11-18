@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -40,6 +41,9 @@ func fixture(t *testing.T) (*Server, string) {
 	ovpn := "client\ndev tun\nremote 127.0.0.1 1194\n<ca>\n" + string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})) + "</ca>\n"
 	return s, ovpn
 }
+
+var testCookies sync.Map
+
 func request(s *Server, method, path string, v any, auth, header bool) *httptest.ResponseRecorder {
 	var b bytes.Buffer
 	if v != nil {
@@ -47,7 +51,16 @@ func request(s *Server, method, path string, v any, auth, header bool) *httptest
 	}
 	r := httptest.NewRequest(method, "http://127.0.0.1:2080"+path, &b)
 	if auth {
-		r.AddCookie(&http.Cookie{Name: "ovpn_session", Value: s.token})
+		cookie, ok := testCookies.Load(s)
+		if !ok {
+			login := request(s, "POST", "/api/login", map[string]string{"username": "admin", "password": "admin"}, false, true)
+			if login.Code != 200 {
+				panic(login.Body.String())
+			}
+			cookie = login.Result().Cookies()[0]
+			testCookies.Store(s, cookie)
+		}
+		r.AddCookie(cookie.(*http.Cookie))
 	}
 	if header {
 		r.Header.Set("X-OVPN-Socks", "1")
@@ -61,18 +74,39 @@ func TestAuthenticationAndRequestBoundary(t *testing.T) {
 	if w := request(s, "GET", "/api/profiles", nil, false, false); w.Code != 401 {
 		t.Fatal(w.Code)
 	}
-	if w := request(s, "GET", "/?token="+s.token, nil, false, false); w.Code != 303 || len(w.Result().Cookies()) != 1 {
-		t.Fatalf("token exchange %d", w.Code)
+	if w := request(s, "GET", "/?token=admin", nil, false, false); w.Code != 200 || len(w.Result().Cookies()) != 0 {
+		t.Fatalf("static page/token bypass %d", w.Code)
+	}
+	if w := request(s, "GET", "/api/profiles?token=admin", nil, false, false); w.Code != 401 {
+		t.Fatal("token bypass accepted")
+	}
+	for _, path := range []string{"/", "/app.js", "/style.css"} {
+		if w := request(s, "GET", path, nil, false, false); w.Code != 200 {
+			t.Fatal(path, w.Code)
+		}
+	}
+	if w := request(s, "GET", "/api/auth", nil, false, false); w.Code != 200 || !strings.Contains(w.Body.String(), `"authenticated":false`) || !strings.Contains(w.Body.String(), `"username":""`) {
+		t.Fatal(w.Body.String())
+	}
+	if w := request(s, "POST", "/api/login", map[string]string{"username": "admin", "password": "admin"}, false, false); w.Code != 403 {
+		t.Fatal("login missing header", w.Code)
+	}
+	if w := request(s, "GET", "/api/profiles", nil, true, false); w.Code != 200 {
+		t.Fatal(w.Body.String())
+	}
+	if w := request(s, "GET", "/api/auth", nil, true, false); !strings.Contains(w.Body.String(), `"username":"admin"`) || !strings.Contains(w.Body.String(), `"authenticated":true`) {
+		t.Fatal(w.Body.String())
 	}
 	if w := request(s, "POST", "/api/profiles", map[string]string{}, true, false); w.Code != 403 {
 		t.Fatal(w.Code)
 	}
 	r := httptest.NewRequest("GET", "http://attacker.invalid/api/profiles", nil)
-	r.AddCookie(&http.Cookie{Name: "ovpn_session", Value: s.token})
+	cookie, _ := testCookies.Load(s)
+	r.AddCookie(cookie.(*http.Cookie))
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
-	if w.Code != 403 {
-		t.Fatal("DNS rebinding host accepted")
+	if w.Code != 200 {
+		t.Fatal("remote host rejected", w.Code)
 	}
 }
 func TestSecretsStayPrivateAndBlankEditsPreserve(t *testing.T) {

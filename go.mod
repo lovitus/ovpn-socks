@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/sagernet/sing-openvpn v0.0.0
+	golang.org/x/crypto v0.48.0
 	golang.org/x/net v0.50.0
 	gvisor.dev/gvisor v0.0.0-20250523182742-eede7a881b20
 )
@@ -17,7 +18,6 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.21 // indirect
 	github.com/sagernet/sing v0.8.12-0.20260702081104-2ded2af32d3d // indirect
 	github.com/tjfoc/gmsm v1.4.1 // indirect
-	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/sys v0.41.0 // indirect
 	golang.org/x/time v0.11.0 // indirect
 )

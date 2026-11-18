@@ -29,7 +29,7 @@ func main() {
 	}
 }
 func run() error {
-	addr := flag.String("listen", "127.0.0.1:2080", "本机管理页面监听地址")
+	addr := flag.String("listen", "0.0.0.0:2080", "Web 管理监听地址，例如 0.0.0.0:2080、192.168.1.10:8080、[::]:2080")
 	dir := flag.String("data-dir", "", "加密数据目录（默认用户配置目录/ovpn-socks）")
 	noBrowser := flag.Bool("no-browser", false, "不自动打开浏览器")
 	showVersion := flag.Bool("version", false, "显示版本")
@@ -88,12 +88,18 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	url := server.URL(listener.Addr().String())
+	browserHost, browserPort, _ := net.SplitHostPort(listener.Addr().String())
+	if ip := net.ParseIP(browserHost); ip == nil || ip.IsUnspecified() {
+		browserHost = "127.0.0.1"
+	}
+	url := "http://" + net.JoinHostPort(browserHost, browserPort) + "/"
 	httpServer := &http.Server{Handler: server.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
 	fmt.Println("OVPN → SOCKS", version, "(用户态 OpenVPN + gVisor)")
 	fmt.Println("数据目录:", *dir)
 	fmt.Println("管理页面:", url)
-	fmt.Println("请妥善保管上面的本机访问链接。Ctrl+C 停止所有连接。")
+	fmt.Println("Web 监听:", listener.Addr().String(), "（远程访问请使用本机对应接口 IP）")
+	fmt.Println("初始管理账号: admin / admin；可在 Web 页面修改。已有账户设置会保留。")
+	fmt.Println("Ctrl+C 停止所有连接。")
 	for _, err := range server.AutoStart() {
 		fmt.Fprintln(os.Stderr, "自动连接:", err)
 	}

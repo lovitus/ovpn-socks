@@ -10,6 +10,7 @@
 *.key
 profiles.enc
 master.key
+admin.json
 coverage.out
 /internal/proxy/.gotmp/
 /internal/config/.gotmp/

@@ -42,6 +42,7 @@ type Store struct {
 	dir      string
 	aead     cipher.AEAD
 	profiles []Profile
+	account  account
 }
 
 var safeID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
@@ -157,6 +158,9 @@ func Open(dir string) (*Store, error) {
 			s.profiles[i] = p
 		}
 	}
+	if err = s.loadAccount(); err != nil {
+		return nil, fmt.Errorf("load admin account: %w", err)
+	}
 	return s, nil
 }
 
@@ -210,20 +214,23 @@ func validate(p Profile) (Profile, error) {
 	if p.Listen != "" {
 		host, port, err := net.SplitHostPort(p.Listen)
 		if err != nil {
-			return p, errors.New("listen must be a loopback host:port")
+			return p, errors.New("listen must be an IP host:port")
 		}
 		if strings.EqualFold(host, "localhost") {
 			host = "127.0.0.1"
 		}
 		ip := net.ParseIP(host)
-		if ip == nil || !ip.IsLoopback() {
-			return p, errors.New("SOCKS listen address must be loopback")
+		if host != "" && ip == nil {
+			return p, errors.New("SOCKS listen address must be an IP")
 		}
 		number, err := strconv.Atoi(port)
 		if err != nil || number < 1 || number > 65535 {
 			return p, errors.New("listen port must be 1 to 65535")
 		}
-		p.Listen = net.JoinHostPort(ip.String(), strconv.Itoa(number))
+		if ip != nil {
+			host = ip.String()
+		}
+		p.Listen = net.JoinHostPort(host, strconv.Itoa(number))
 	}
 	return p, nil
 }
@@ -264,7 +271,7 @@ func (s *Store) Save(p Profile) (Profile, error) {
 	if p.Listen == "" {
 		for port := 1080; port <= 65535; port++ {
 			if !used[strconv.Itoa(port)] {
-				p.Listen = net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+				p.Listen = net.JoinHostPort("0.0.0.0", strconv.Itoa(port))
 				break
 			}
 		}

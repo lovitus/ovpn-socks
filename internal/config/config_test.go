@@ -84,11 +84,11 @@ func TestEncryptedCRUD(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.ID == "" || p.Listen != "127.0.0.1:1080" {
+	if p.ID == "" || p.Listen != "0.0.0.0:1080" {
 		t.Fatal(p)
 	}
 	p2, err := s.Save(sampleProfile())
-	if err != nil || p2.Listen != "127.0.0.1:1081" {
+	if err != nil || p2.Listen != "0.0.0.0:1081" {
 		t.Fatal(p2, err)
 	}
 	data, err := os.ReadFile(filepath.Join(dir, dataFile))
@@ -144,7 +144,7 @@ func TestValidation(t *testing.T) {
 	}
 	for _, change := range []func(*Profile){
 		func(p *Profile) { p.ID = "../escape" }, func(p *Profile) { p.Name = " " }, func(p *Profile) { p.OVPN = " " }, func(p *Profile) { p.TOTPSeed = "bad!" }, func(p *Profile) { p.TOTPMode = "other" },
-		func(p *Profile) { p.Listen = "0.0.0.0:1080" }, func(p *Profile) { p.Listen = "[::]:1080" }, func(p *Profile) { p.Listen = "example.com:1080" }, func(p *Profile) { p.Listen = "127.0.0.1:0" }, func(p *Profile) { p.Listen = "127.0.0.1:65536" },
+		func(p *Profile) { p.Listen = "example.com:1080" }, func(p *Profile) { p.Listen = "127.0.0.1:0" }, func(p *Profile) { p.Listen = "127.0.0.1:65536" },
 	} {
 		p := sampleProfile()
 		change(&p)
@@ -158,12 +158,38 @@ func TestValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.ID = "second"
-	p.Listen = "127.0.0.1:1080"
+	p.Listen = "0.0.0.0:1080"
 	if _, err = s.Save(p); err == nil {
 		t.Fatal("accepted duplicate port")
 	}
 	if err = s.Delete("../../escape"); err == nil {
 		t.Fatal("accepted unsafe ID")
+	}
+}
+
+func TestExplicitListenAddressesRemainUnchanged(t *testing.T) {
+	for _, addr := range []string{"127.0.0.1:1080", "0.0.0.0:1080", "192.168.1.15:1080", "[::]:1080", "[2001:db8::15]:1080", ":1080"} {
+		t.Run(addr, func(t *testing.T) {
+			dir := t.TempDir()
+			s, err := Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := sampleProfile()
+			p.Listen = addr
+			p, err = s.Save(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s, err = Open(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, ok := s.Get(p.ID)
+			if !ok || got.Listen != addr {
+				t.Fatal("explicit listen changed", got.Listen)
+			}
+		})
 	}
 }
 

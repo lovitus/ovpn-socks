@@ -2,10 +2,7 @@ package app
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/subtle"
 	"embed"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,27 +23,24 @@ import (
 var assets embed.FS
 
 type Server struct {
-	store    *config.Store
-	openvpn  string
-	token    string
-	host     string
-	mu       sync.Mutex
-	sessions map[string]*vpn.Session
-	ctx      context.Context
-	cancel   context.CancelFunc
+	store      *config.Store
+	openvpn    string
+	authMu     sync.Mutex
+	logins     map[string]time.Time
+	authTokens float64
+	authLast   time.Time
+	mu         sync.Mutex
+	sessions   map[string]*vpn.Session
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 func New(store *config.Store, openvpn string) (*Server, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return nil, err
-	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Server{store: store, openvpn: openvpn, token: hex.EncodeToString(b), sessions: map[string]*vpn.Session{}, ctx: ctx, cancel: cancel}, nil
+	return &Server{store: store, openvpn: openvpn, logins: map[string]time.Time{}, authTokens: 10, authLast: time.Now(), sessions: map[string]*vpn.Session{}, ctx: ctx, cancel: cancel}, nil
 }
 func (s *Server) URL(addr string) string {
-	s.host = addr
-	return "http://" + addr + "/?token=" + s.token
+	return "http://" + addr + "/"
 }
 func (s *Server) Close() {
 	s.cancel()
@@ -73,29 +67,26 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
-	if r.Host != s.host {
-		http.Error(w, "invalid host", http.StatusForbidden)
-		return
-	}
-	if r.URL.Path == "/" && r.Method == http.MethodGet && equal(r.URL.Query().Get("token"), s.token) {
-		http.SetCookie(w, &http.Cookie{Name: "ovpn_session", Value: s.token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
-		http.Redirect(w, r, "/", http.StatusSeeOther)
-		return
-	}
-	cookie, err := r.Cookie("ovpn_session")
-	if err != nil || !equal(cookie.Value, s.token) {
-		http.Error(w, "请使用程序启动时显示的完整管理链接。", http.StatusUnauthorized)
-		return
-	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		if r.Header.Get("X-OVPN-Socks") != "1" {
 			http.Error(w, "missing request header", http.StatusForbidden)
 			return
 		}
-		if origin := r.Header.Get("Origin"); origin != "" && origin != "http://"+s.host {
+		scheme := "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+		if origin := r.Header.Get("Origin"); origin != "" && origin != scheme+"://"+r.Host {
 			http.Error(w, "invalid origin", http.StatusForbidden)
 			return
 		}
+	}
+	if s.authRoute(w, r) {
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/") && !s.authenticated(r) {
+		fail(w, http.StatusUnauthorized, errors.New("请先登录"))
+		return
 	}
 	switch {
 	case r.URL.Path == "/api/profiles":
@@ -107,7 +98,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 			fail(w, 405, errors.New("method not allowed"))
 			return
 		}
-		writeJSON(w, map[string]any{"openvpn": s.openvpn, "default_socks": "127.0.0.1:1080", "udp_associate": false})
+		writeJSON(w, map[string]any{"openvpn": s.openvpn, "default_socks": "0.0.0.0:1080", "udp_associate": false})
 	case r.URL.Path == "/" || r.URL.Path == "/app.js" || r.URL.Path == "/style.css":
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", 405)
@@ -128,9 +119,6 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
-}
-func equal(a, b string) bool {
-	return len(a) == len(b) && subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -313,8 +301,8 @@ func ValidateListen(addr string) error {
 		return err
 	}
 	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsLoopback() {
-		return errors.New("管理地址必须是 loopback IP，例如 127.0.0.1:2080")
+	if host != "" && ip == nil {
+		return errors.New("管理地址必须是 IP，例如 0.0.0.0:2080 或 [::]:2080")
 	}
 	n, err := strconv.Atoi(port)
 	if err != nil || n < 0 || n > 65535 {

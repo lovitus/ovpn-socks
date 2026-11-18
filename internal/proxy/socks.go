@@ -1,4 +1,4 @@
-// Package proxy provides a loopback SOCKS5 TCP CONNECT endpoint. All outbound
+// Package proxy provides a configurable SOCKS5 TCP CONNECT endpoint. All outbound
 // connections are supplied by the caller; there is deliberately no default dialer.
 package proxy
 
@@ -36,8 +36,8 @@ func Listen(address string, dial DialFunc) (*Server, error) {
 		return nil, err
 	}
 	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsLoopback() {
-		return nil, errors.New("SOCKS listener must use an explicit loopback IP")
+	if host != "" && ip == nil {
+		return nil, errors.New("SOCKS listener must use an IP address")
 	}
 	ln, err := net.Listen("tcp", address)
 	if err != nil {

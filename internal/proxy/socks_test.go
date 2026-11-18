@@ -78,11 +78,23 @@ func TestSOCKSOfflineFailsClosedAndUDPUnsupported(t *testing.T) {
 		t.Fatalf("unsupported commands dialed: %d", count.Load())
 	}
 }
-func TestSOCKSRejectsPublicListeners(t *testing.T) {
-	for _, address := range []string{"0.0.0.0:0", ":0", "localhost:0", "[::]:0"} {
-		if s, err := Listen(address, func(context.Context, string) (net.Conn, error) { return nil, errors.New("offline") }); err == nil {
-			s.Close()
-			t.Errorf("accepted %s", address)
+func TestSOCKSInterfaceListeners(t *testing.T) {
+	for _, address := range []string{"0.0.0.0:0", ":0", "127.0.0.1:0"} {
+		s, err := Listen(address, func(context.Context, string) (net.Conn, error) { return nil, errors.New("offline") })
+		if err != nil {
+			t.Fatalf("listen %s: %v", address, err)
 		}
+		_, port, _ := net.SplitHostPort(s.Addr())
+		c, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", port), time.Second)
+		if err != nil {
+			s.Close()
+			t.Fatal(err)
+		}
+		c.Close()
+		s.Close()
+	}
+	if s, err := Listen("invalid.example:0", func(context.Context, string) (net.Conn, error) { return nil, errors.New("offline") }); err == nil {
+		s.Close()
+		t.Fatal("accepted non-IP listener")
 	}
 }

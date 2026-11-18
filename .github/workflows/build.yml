@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -60,7 +60,13 @@ jobs:
             EXT=""
             if [ "$OS" = windows ]; then EXT=".exe"; fi
             GOOS="$OS" GOARCH="$ARCH" go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o "dist/${NAME}${EXT}" ./cmd/ovpn-socks
+            if [ "$OS" = windows ]; then
+              zip -j "dist/${NAME}.zip" "dist/${NAME}${EXT}" README.md LICENSE THIRD_PARTY.md
+            else
+              tar -czf "dist/${NAME}.tar.gz" -C dist "$NAME" -C "$GITHUB_WORKSPACE" README.md LICENSE THIRD_PARTY.md
+            fi
           done
+          ./dist/ovpn-socks-linux-amd64 -version
           cp README.md LICENSE THIRD_PARTY.md dist/
           cd dist && sha256sum ovpn-socks-* > SHA256SUMS
       - uses: actions/upload-artifact@v4

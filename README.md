@@ -23,10 +23,22 @@ chmod +x ovpn-socks-linux-amd64
 ./ovpn-socks-linux-amd64
 ```
 
-默认管理地址 `127.0.0.1:2080`。请通过启动时输出的完整访问链接打开；链接会换取 HttpOnly / SameSite cookie，随后从地址栏移除凭据。每次启动生成新的管理访问凭据。保持终端运行，按 Ctrl+C 退出。
+默认 Web 监听 `0.0.0.0:2080`。本机打开 `http://127.0.0.1:2080/`，远程打开 `http://服务器接口IP:2080/`。初始管理用户名和密码均为 **admin**，登录后通过右上角「账户设置」修改。账户设置持久保存，修改后所有旧会话失效，需要重新登录；重启不会重置账户。保持终端运行，按 Ctrl+C 退出。
+
+发布提供 Windows / Linux / macOS 的 amd64、arm64 六种独立可执行文件。macOS Intel 选择 `darwin-amd64`，Apple Silicon 选择 `darwin-arm64`；Linux x86_64 选择 `linux-amd64`，ARM64 选择 `linux-arm64`。
+
+```sh
+# Linux 服务器，覆盖默认 Web 端口
+./ovpn-socks-linux-amd64 -listen 0.0.0.0:8080 -no-browser
+# macOS Apple Silicon，绑定指定接口
+chmod +x ovpn-socks-darwin-arm64
+./ovpn-socks-darwin-arm64 -listen 192.168.1.10:2080
+# IPv6 全接口
+./ovpn-socks-linux-arm64 -listen '[::]:2080' -no-browser
+```
 
 ```text
--listen 127.0.0.1:2080   管理页面地址，仅允许 loopback IP
+-listen 0.0.0.0:2080     Web 地址，支持任意本机 IPv4 / IPv6 接口或全接口
 -data-dir PATH           本机加密配置目录
 -no-browser              不自动打开浏览器
 -version                 版本与平台
@@ -37,7 +49,7 @@ chmod +x ovpn-socks-linux-amd64
 
 1. 点击「新建连接」，导入 `.ovpn` 文件或粘贴配置内容。配置应包含内联的 `<ca>`、`<cert>`、`<key>` 等所需材料。
 2. 填写 VPN 用户名和密码。若服务端要求 `password+6位验证码`，密码框填写静态密码，seed 框填写 Google Authenticator 的 Base32 seed 或 `otpauth://totp/...` URI，认证方式选择「密码 + 动态验证码」。
-3. SOCKS 地址留空时，从 `127.0.0.1:1080` 起为不同配置分配端口。也可指定其他 IPv4 / IPv6 loopback 端口。
+3. SOCKS 地址留空时，从 `0.0.0.0:1080` 起为不同配置分配端口。也可指定任意本机 IPv4 / IPv6 接口，例如 `192.168.1.10:1080`、`127.0.0.1:1080` 或 `[::]:1080`。已有配置保持原监听地址。
 4. 默认启用断线自动重连。「程序启动时自动连接」可单独勾选。
 5. 点击「启动」。连接后，在应用中配置对应的 SOCKS5 端口。域名会使用 VPN 下发的 DNS，经该连接的 gVisor 网络栈解析；未下发 DNS 时拒绝域名解析，可使用 IP 地址。
 6. 「路由与日志」显示服务端下发的 IPv4 / IPv6 网段、网关、DNS、隧道地址和连接日志。路由会同时打印到终端，不会添加到系统路由表。可复制网段，交给你自己的 tun2socks / 策略路由工具。
@@ -51,6 +63,8 @@ curl --socks5-hostname 127.0.0.1:1080 http://10.10.0.10/
 不同 VPN 即使使用相同私网段，也由各自独立的用户态栈和 SOCKS 端口隔离。离线后现有代理连接关闭，新的请求拒绝转发，不回退本机直连。
 
 ## 认证和存储
+
+管理账户与 VPN 账户相互独立。管理密码以随机 salt + PBKDF2-SHA256 hash 保存在本机 `admin.json`，不保存明文。页面修改账户后所有会话失效；只修改用户名时，新密码留空即可保留。首次从 v0.1.0 升级会创建 admin/admin 管理账户，并保留原有 VPN 加密配置。
 
 - 支持纯密码、密码追加 TOTP、仅 TOTP。默认 seed 参数为 SHA1、6 位、30 秒；otpauth URI 还支持 SHA256 / SHA512、8 位、自定义周期。seed 支持末尾 `=` 填充。
 - 每次完整 TLS 认证（包括重新协商）需要密码时动态生成 TOTP；服务端下发的有效认证 token 按 OpenVPN 语义优先使用。
@@ -66,7 +80,7 @@ curl --socks5-hostname 127.0.0.1:1080 http://10.10.0.10/
 
 本工具严格解析配置，拒绝外部证书路径、脚本、插件以及未知指令，不会执行导入文件中的命令。系统网卡相关的安全无关客户端指令只作为兼容配置处理。TAP / Ethernet 桥接、私钥密码交互、SAML / 浏览器登录和自定义交互 challenge 暂不提供界面支持；遇到不支持的配置会报错，不会跳过安全设置。
 
-**当前 SOCKS5 支持 TCP CONNECT；不支持 UDP ASSOCIATE / BIND。** 使用 tun2socks 时请配置 TCP 模式。SOCKS 仅监听本机回环地址，不提供对外访问或额外 SOCKS 用户认证。
+**当前 SOCKS5 支持 TCP CONNECT；不支持 UDP ASSOCIATE / BIND。** 使用 tun2socks 时请配置 TCP 模式。SOCKS 支持全接口和指定接口监听，不提供额外 SOCKS 用户认证；Web 管理账户用于登录管理页面。Web 使用 HTTP；如需通过公网管理，可在前方配置 HTTPS 反向代理。
 
 ## 构建和验证
 

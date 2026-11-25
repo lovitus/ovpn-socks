@@ -25,16 +25,38 @@ const fileHeader = "OVPNSOCKS\x01"
 
 // Profile contains connection settings. Every field is encrypted at rest.
 type Profile struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	OVPN          string `json:"ovpn"`
-	Username      string `json:"username"`
-	Password      string `json:"password"`
-	TOTPSeed      string `json:"totp_seed"`
-	TOTPMode      string `json:"totp_mode"`
-	Listen        string `json:"listen"`
-	AutoConnect   bool   `json:"auto_connect"`
-	AutoReconnect bool   `json:"auto_reconnect"`
+	ID               string     `json:"id"`
+	Name             string     `json:"name"`
+	OVPN             string     `json:"ovpn"`
+	Username         string     `json:"username"`
+	Password         string     `json:"password"`
+	TOTPSeed         string     `json:"totp_seed"`
+	TOTPMode         string     `json:"totp_mode"`
+	Listen           string     `json:"listen"`
+	AutoConnect      bool       `json:"auto_connect"`
+	AutoReconnect    bool       `json:"auto_reconnect"`
+	Engine           string     `json:"engine,omitempty"`
+	Arguments        string     `json:"arguments,omitempty"`
+	EngineConfig     string     `json:"engine_config,omitempty"`
+	ConfigFormat     string     `json:"config_format,omitempty"`
+	WorkingDirectory string     `json:"working_directory,omitempty"`
+	Listeners        []Listener `json:"listeners,omitempty"`
+}
+
+// Listener is a declaration parsed by the native engine, not a runtime claim.
+type Listener struct {
+	ID      string `json:"id"`
+	Network string `json:"network"`
+	Address string `json:"address"`
+	Scope   string `json:"scope"`
+	Kind    string `json:"kind"`
+}
+
+func (p Profile) EngineName() string {
+	if p.Engine == "" {
+		return "openvpn"
+	}
+	return p.Engine
 }
 
 type Store struct {
@@ -143,18 +165,21 @@ func Open(dir string) (*Store, error) {
 		}
 		ids, ports := map[string]bool{}, map[string]bool{}
 		for i, p := range s.profiles {
-			if !safeID.MatchString(p.ID) || ids[p.ID] || p.Listen == "" {
+			if !safeID.MatchString(p.ID) || ids[p.ID] || (p.EngineName() == "openvpn" && p.Listen == "") {
 				return nil, errors.New("invalid or duplicate saved profile ID/listen address")
 			}
 			p, err = validate(p)
 			if err != nil {
 				return nil, fmt.Errorf("invalid saved profile: %w", err)
 			}
-			_, port, _ := net.SplitHostPort(p.Listen)
-			if ports[port] {
-				return nil, errors.New("duplicate saved profile port")
+			if p.EngineName() == "openvpn" {
+				_, port, _ := net.SplitHostPort(p.Listen)
+				if ports[port] {
+					return nil, errors.New("duplicate saved profile port")
+				}
+				ports[port] = true
 			}
-			ids[p.ID], ports[port] = true, true
+			ids[p.ID] = true
 			s.profiles[i] = p
 		}
 	}
@@ -179,13 +204,18 @@ func readRegular(path string) ([]byte, error) {
 func (s *Store) List() []Profile {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return append([]Profile{}, s.profiles...)
+	result := append([]Profile{}, s.profiles...)
+	for i := range result {
+		result[i].Listeners = append([]Listener(nil), result[i].Listeners...)
+	}
+	return result
 }
 func (s *Store) Get(id string) (Profile, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, p := range s.profiles {
 		if p.ID == id {
+			p.Listeners = append([]Listener(nil), p.Listeners...)
 			return p, true
 		}
 	}
@@ -199,6 +229,28 @@ func validate(p Profile) (Profile, error) {
 	p.Name = strings.TrimSpace(p.Name)
 	if p.Name == "" || len(p.Name) > 256 {
 		return p, errors.New("profile name must contain 1 to 256 bytes")
+	}
+	switch p.EngineName() {
+	case "openvpn":
+		// Preserve legacy profiles without requiring a migration.
+	case "flyssh", "gust":
+		if len(p.Arguments) > 128*1024 || len(p.EngineConfig) > 2*1024*1024 {
+			return p, errors.New("engine arguments or configuration too large")
+		}
+		if strings.TrimSpace(p.Arguments) == "" && strings.TrimSpace(p.EngineConfig) == "" {
+			return p, errors.New("请输入引擎命令行参数或配置文件内容")
+		}
+		if p.WorkingDirectory != "" && !filepath.IsAbs(p.WorkingDirectory) {
+			return p, errors.New("工作目录必须是服务器上的绝对路径")
+		}
+		if len(p.Listeners) > 256 {
+			return p, errors.New("最多支持 256 个监听声明")
+		}
+		p.Listen = ""
+		p.OVPN, p.Username, p.Password, p.TOTPSeed, p.TOTPMode = "", "", "", "", ""
+		return p, nil
+	default:
+		return p, errors.New("未知连接引擎")
 	}
 	if strings.TrimSpace(p.OVPN) == "" {
 		return p, errors.New("OpenVPN configuration is required")
@@ -263,12 +315,12 @@ func (s *Store) Save(p Profile) (Profile, error) {
 	}
 	used := map[string]bool{}
 	for _, old := range s.profiles {
-		if old.ID != p.ID {
+		if old.ID != p.ID && old.EngineName() == "openvpn" {
 			_, port, _ := net.SplitHostPort(old.Listen)
 			used[port] = true
 		}
 	}
-	if p.Listen == "" {
+	if p.EngineName() == "openvpn" && p.Listen == "" {
 		for port := 1080; port <= 65535; port++ {
 			if !used[strconv.Itoa(port)] {
 				p.Listen = net.JoinHostPort("0.0.0.0", strconv.Itoa(port))
@@ -283,6 +335,7 @@ func (s *Store) Save(p Profile) (Profile, error) {
 	if used[port] {
 		return Profile{}, errors.New("listen port is already assigned to another profile")
 	}
+	p.Listeners = append([]Listener(nil), p.Listeners...)
 	next := append([]Profile{}, s.profiles...)
 	replaced := false
 	for i := range next {
@@ -299,6 +352,7 @@ func (s *Store) Save(p Profile) (Profile, error) {
 		return Profile{}, err
 	}
 	s.profiles = next
+	p.Listeners = append([]Listener(nil), p.Listeners...)
 	return p, nil
 }
 

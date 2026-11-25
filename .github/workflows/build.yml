@@ -24,7 +24,7 @@ jobs:
       - run: go vet ./...
       - name: Check concurrent counters and reconnect snapshots
         if: runner.os == 'Linux'
-        run: go test -race -count=1 ./internal/proxy ./internal/vpn ./internal/routeexport
+        run: go test -race -count=1 ./internal/proxy ./internal/vpn ./internal/routeexport ./internal/engine
       - name: Test upstream credential callback patch
         working-directory: third_party/sing-openvpn
         run: go test -count=1 ./...
@@ -43,13 +43,38 @@ jobs:
       - name: Real OpenVPN server to userspace client to SOCKS
         run: sudo --preserve-env=PATH,HOME,GOPATH,GOCACHE env OVPN_INTEGRATION=1 go test -count=1 -timeout 5m -v ./internal/vpn
   build:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Fetch latest FlySSH source
+        uses: actions/checkout@v4
+        with:
+          repository: lovitus/flyssh
+          ref: main
+          path: .engine-src/flyssh
+          persist-credentials: false
+      - name: Fetch latest gust source
+        uses: actions/checkout@v4
+        with:
+          repository: lovitus/gust
+          ref: master
+          path: .engine-src/gust
+          persist-credentials: false
+      - name: Fetch private gust dependency with a read-only deploy key
+        uses: actions/checkout@v4
+        with:
+          repository: lovitus/gust-x
+          ref: master
+          path: .engine-src/gust-x
+          ssh-key: ${{ secrets.GUST_X_READ_KEY }}
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.5'
           cache: true
+      - name: Apply managed observation overlays and build embedded relays
+        run: python3 scripts/build_engines.py --sources .engine-src --out dist/engines --prepare
       - name: Build portable binaries
         env:
           CGO_ENABLED: '0'
@@ -62,20 +87,31 @@ jobs:
             NAME="ovpn-socks-${OS}-${ARCH}"
             EXT=""
             if [ "$OS" = windows ]; then EXT=".exe"; fi
-            GOOS="$OS" GOARCH="$ARCH" go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o "dist/${NAME}${EXT}" ./cmd/ovpn-socks
+            PKG="dist/packages/${NAME}"
+            mkdir -p "$PKG/engines"
+            GOOS="$OS" GOARCH="$ARCH" go build -trimpath -ldflags "-s -w -X main.version=$VERSION" -o "$PKG/${NAME}${EXT}" ./cmd/ovpn-socks
+            python3 scripts/build_engines.py --sources .engine-src --out "$PKG/engines" --os "$OS" --arch "$ARCH"
+            cp README.md LICENSE THIRD_PARTY.md "$PKG/"
             if [ "$OS" = windows ]; then
-              zip -j "dist/${NAME}.zip" "dist/${NAME}${EXT}" README.md LICENSE THIRD_PARTY.md
+              (cd "$PKG" && zip -r "../../${NAME}.zip" .)
             else
-              tar -czf "dist/${NAME}.tar.gz" -C dist "$NAME" -C "$GITHUB_WORKSPACE" README.md LICENSE THIRD_PARTY.md
+              tar -czf "dist/${NAME}.tar.gz" -C "$PKG" .
             fi
           done
-          ./dist/ovpn-socks-linux-amd64 -version
-          cp README.md LICENSE THIRD_PARTY.md dist/
-          cd dist && sha256sum ovpn-socks-* > SHA256SUMS
+          OVPN_ENGINE_TEST_FLYSSH="$GITHUB_WORKSPACE/dist/packages/ovpn-socks-linux-amd64/engines/flyssh" OVPN_ENGINE_TEST_GUST="$GITHUB_WORKSPACE/dist/packages/ovpn-socks-linux-amd64/engines/gust" go test ./internal/engine -count=1
+          python3 engines/flyssh/test_inspect.py dist/packages/ovpn-socks-linux-amd64/engines/flyssh
+          python3 engines/gust/test_managed.py dist/packages/ovpn-socks-linux-amd64/engines/gust
+          ./dist/packages/ovpn-socks-linux-amd64/ovpn-socks-linux-amd64 -version
+          cp .engine-src/managed-manifest.json dist/ENGINE_SOURCES.json
+          cd dist && sha256sum ovpn-socks-*.zip ovpn-socks-*.tar.gz > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: ovpn-socks-portable
-          path: dist/*
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/SHA256SUMS
+            dist/ENGINE_SOURCES.json
           if-no-files-found: error
           retention-days: 30
   release:

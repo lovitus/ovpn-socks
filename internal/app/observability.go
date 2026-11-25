@@ -83,6 +83,10 @@ type anyMetrics struct {
 }
 
 func (s *Server) exportRoutes(w http.ResponseWriter, r *http.Request, p config.Profile) {
+	if p.EngineName() != "openvpn" {
+		fail(w, 400, errors.New("路由转换仅适用于 OpenVPN 下发的网段"))
+		return
+	}
 	var input struct {
 		Format string `json:"format"`
 		Host   string `json:"host"`

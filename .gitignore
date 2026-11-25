@@ -1,6 +1,7 @@
 /dist/
 /.local/
 /.verify/
+/.engine-src/
 /.gotmp/
 /.gocache/
 *.exe

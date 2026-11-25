@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -115,7 +116,7 @@ func TestEncryptedCRUD(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, ok := reopened.Get(p.ID)
-	if !ok || got != p {
+	if !ok || !reflect.DeepEqual(got, p) {
 		t.Fatalf("roundtrip: %+v vs %+v", got, p)
 	}
 	if err = reopened.Delete(p.ID); err != nil {

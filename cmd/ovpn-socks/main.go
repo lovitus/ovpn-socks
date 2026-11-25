@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/lovitus/ovpn-socks/internal/app"
 	"github.com/lovitus/ovpn-socks/internal/config"
+	"github.com/lovitus/ovpn-socks/internal/engine"
 	"github.com/lovitus/ovpn-socks/internal/ovpnconfig"
 )
 
@@ -61,19 +63,37 @@ func run() error {
 			defer f.Close()
 		}
 		var p config.Profile
-		decoder := json.NewDecoder(f)
+		limited := &io.LimitedReader{R: f, N: 8*1024*1024 + 1}
+		decoder := json.NewDecoder(limited)
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&p); err != nil {
 			return err
 		}
-		if _, err := ovpnconfig.Parse(p.OVPN); err != nil {
-			return err
+		if err := decoder.Decode(new(any)); err != io.EOF {
+			return fmt.Errorf("导入文件必须仅包含一个 JSON 配置对象")
+		}
+		if limited.N <= 0 {
+			return fmt.Errorf("导入文件超过 8 MiB 上限")
+		}
+		p.Listeners = nil
+		if p.EngineName() == "openvpn" {
+			if _, err := ovpnconfig.Parse(p.OVPN); err != nil {
+				return err
+			}
+		} else {
+			parsed, err := engine.Inspect(context.Background(), engine.Options{Engine: p.EngineName(), Arguments: p.Arguments, ConfigText: p.EngineConfig, ConfigFormat: p.ConfigFormat, WorkingDirectory: p.WorkingDirectory})
+			if err != nil {
+				return err
+			}
+			for _, l := range parsed.Listeners {
+				p.Listeners = append(p.Listeners, config.Listener{ID: l.ID, Network: l.Network, Address: l.Address, Scope: l.Scope, Kind: l.Kind})
+			}
 		}
 		saved, err := store.Save(p)
 		if err != nil {
 			return err
 		}
-		fmt.Println("已加密导入:", saved.ID, saved.Name, "SOCKS", saved.Listen)
+		fmt.Println("已加密导入:", saved.ID, saved.Name, "引擎", saved.EngineName(), saved.Listen)
 		return nil
 	}
 	if err := app.ValidateListen(*addr); err != nil {
@@ -94,7 +114,7 @@ func run() error {
 	}
 	url := "http://" + net.JoinHostPort(browserHost, browserPort) + "/"
 	httpServer := &http.Server{Handler: server.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
-	fmt.Println("OVPN → SOCKS", version, "(用户态 OpenVPN + gVisor)")
+	fmt.Println("OVPN → SOCKS", version, "(OpenVPN + gVisor / FlySSH / gust)")
 	fmt.Println("数据目录:", *dir)
 	fmt.Println("管理页面:", url)
 	fmt.Println("Web 监听:", listener.Addr().String(), "（远程访问请使用本机对应接口 IP）")

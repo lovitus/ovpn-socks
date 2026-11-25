@@ -1,0 +1,223 @@
+// Added by ovpn-socks. Private bounded stdout protocol; no HTTP endpoint.
+package main
+
+import (
+ "crypto/sha256"
+ "encoding/hex"
+ "encoding/json"
+ "errors"
+ "flag"
+ "fmt"
+ "io"
+ "net"
+ "os"
+ "strings"
+ "sync"
+ "sync/atomic"
+ "time"
+
+ "github.com/go-gost/x/config"
+ "github.com/go-gost/x/config/loader"
+ "github.com/go-gost/x/config/parsing/parser"
+ xmetrics "github.com/go-gost/x/metrics"
+ "github.com/go-gost/x/registry"
+ xservice "github.com/go-gost/x/service"
+)
+
+var managedToken string
+var managedOutput sync.Mutex
+var managedDone atomic.Bool
+var managedInitial *config.Config
+
+type managedListener struct {
+ ID string `json:"id"`
+ Network string `json:"network"`
+ Address string `json:"address"`
+ ActualAddress string `json:"actual_address,omitempty"`
+ Scope string `json:"scope"`
+ Kind string `json:"kind"`
+ State string `json:"state"`
+ Error string `json:"error,omitempty"`
+ Upload uint64 `json:"upload_bytes"`
+ Download uint64 `json:"download_bytes"`
+ Active int64 `json:"active_connections"`
+ Total uint64 `json:"total_connections"`
+ Failed uint64 `json:"failed_connections"`
+ Available bool `json:"metrics_available"`
+ CounterScope string `json:"counter_scope"`
+ ConnectionScope string `json:"connection_scope"`
+}
+type managedRecord struct {
+ Version int `json:"version"`
+ Type string `json:"type"`
+ Engine string `json:"engine"`
+ State string `json:"state,omitempty"`
+ Timestamp int64 `json:"timestamp_ms"`
+ Listeners []managedListener `json:"listeners,omitempty"`
+ Upload uint64 `json:"upload_bytes"`
+ Download uint64 `json:"download_bytes"`
+ Active int64 `json:"active_connections"`
+ Total uint64 `json:"total_connections"`
+ Failed uint64 `json:"failed_connections"`
+ Available bool `json:"metrics_available"`
+ CounterScope string `json:"counter_scope,omitempty"`
+ ConnectionScope string `json:"connection_scope,omitempty"`
+ ErrorCode string `json:"error_code,omitempty"`
+}
+func managedEmit(r managedRecord) {
+ if managedToken == "" { return }
+ r.Version, r.Engine, r.Timestamp = 1,"gust",time.Now().UnixMilli()
+ b,err := json.Marshal(r)
+ if err != nil || len(b)>256*1024 { return }
+ managedOutput.Lock(); defer managedOutput.Unlock()
+ fmt.Fprintf(os.Stdout,"OVPN_ENGINE_%s %s\n",managedToken,b)
+}
+func managedFail(code string) {
+ managedEmit(managedRecord{Type:"error",State:"failed",ErrorCode:code})
+ os.Exit(2)
+}
+func managedBeforeFlags() {
+ managedToken = os.Getenv("OVPN_SOCKS_TELEMETRY_TOKEN")
+ if managedToken == "" {
+  if os.Getenv("OVPN_SOCKS_INSPECT") == "1" { fmt.Fprintln(os.Stderr,"managed inspection requires a telemetry token"); os.Exit(2) }
+  return
+ }
+ b,err := hex.DecodeString(managedToken)
+ if err != nil || len(b)!=16 { fmt.Fprintln(os.Stderr,"invalid managed telemetry token"); os.Exit(2) }
+ for _,a := range os.Args[1:] {
+  name := strings.SplitN(a,"=",2)[0]
+  switch name {
+  case "--","-watchdog","--watchdog","-O","--O","-V","--V","-daemon","--daemon": managedFail("unsupported_mode")
+  }
+ }
+ if os.Getenv("_GOST_ID")!="" || os.Getenv("_GOST_WATCHDOG_CHILD")!="" { managedFail("unsupported_mode") }
+ flag.CommandLine.Init(os.Args[0],flag.ContinueOnError)
+ flag.CommandLine.SetOutput(io.Discard)
+}
+func managedParseFlags() {
+ if managedToken == "" { flag.Parse(); return }
+ if err := flag.CommandLine.Parse(os.Args[1:]); err != nil { managedFail("invalid_arguments") }
+ if flag.NArg()!=0 { managedFail("invalid_arguments") }
+}
+func managedAfterFlags() {
+ if managedToken == "" { return }
+ for _,source := range cfgFiles {
+  v:=strings.TrimSpace(source)
+  if v=="-" || strings.HasPrefix(strings.ToLower(v),"http://") || strings.HasPrefix(strings.ToLower(v),"https://") { managedFail("unsupported_mode") }
+ }
+ parser.Init(parser.Args{CfgFiles:cfgFiles,Services:services,Nodes:nodes,Debug:debug,Trace:trace,ApiAddr:apiAddr,MetricsAddr:metricsAddr})
+ cfg,err:=parser.Parse()
+ if err!=nil {
+  if errors.Is(err,os.ErrNotExist) { managedFail("config_not_found") }
+  managedFail("invalid_config")
+ }
+ if len(cfg.Services)>256 { managedFail("too_many_listeners") }
+ for _,s:=range cfg.Services {
+  if s!=nil && s.Listener!=nil && (s.Listener.Type=="stdio" || s.Listener.Type=="serial" || registry.ServiceFactoryRegistry().Get(s.Listener.Type)!=nil) { managedFail("unsupported_mode") }
+ }
+ if err:=loader.ManagedValidate(cfg); err!=nil { managedFail("invalid_config") }
+ managedInitial=cfg
+ if os.Getenv("OVPN_SOCKS_INSPECT")=="1" { managedEmit(managedBuild(cfg,true)); os.Exit(0) }
+ xmetrics.ManagedEnable()
+ for _,s:=range cfg.Services { if loader.ManagedMetricService(s) { xmetrics.ManagedTrack(s.Name) } }
+ managedEmit(managedBuild(cfg,false))
+ go managedWatch()
+}
+func managedWatch() {
+ t:=time.NewTicker(250*time.Millisecond); defer t.Stop()
+ var previous string
+ last:=time.Time{}
+ for range t.C {
+  if managedDone.Load() { return }
+  cfg:=config.Global()
+  if len(cfg.Services)==0 { cfg=managedInitial }
+  r:=managedBuild(cfg,false)
+  // Ignore counters when deciding lifecycle emission frequency.
+  var signature strings.Builder
+  signature.WriteString(r.State)
+  for _,s:=range r.Listeners { signature.WriteString(s.ID+":"+s.State+":"+s.ActualAddress+":"+s.Error+";") }
+  key:=signature.String()
+  if key!=previous || time.Since(last)>=2*time.Second { managedEmit(r); previous=key; last=time.Now() }
+ }
+}
+func managedStopped() {
+ if managedToken=="" { return }
+ managedDone.Store(true)
+ r:=managedBuild(config.Global(),false); r.State="stopped"
+ for i:=range r.Listeners { r.Listeners[i].State="closed" }
+ managedEmit(r)
+}
+func managedRuntimeError() { managedEmit(managedRecord{Type:"error",State:"failed",ErrorCode:"invalid_config"}) }
+func managedBuild(cfg *config.Config,inspect bool) managedRecord {
+ r:=managedRecord{Type:"snapshot",State:"starting",Available:true,CounterScope:"sum_of_instrumented_native_service_wrappers",ConnectionScope:"native_accepted_handler_requests_and_handler_errors;not_all_UDP_associations"}
+ if inspect { r.Type="inspect"; r.State="configured"; r.Available=false }
+ if cfg==nil { r.Available=false; return r }
+ ready:=0
+ degraded:=false
+ for i,s:=range cfg.Services {
+  if i>=256 { degraded=true; r.Available=false; break }
+  if s==nil { continue }
+  lt,ht:="tcp","auto"
+  if s.Listener!=nil && strings.TrimSpace(s.Listener.Type)!="" { lt=s.Listener.Type }
+  if s.Handler!=nil && strings.TrimSpace(s.Handler.Type)!="" { ht=s.Handler.Type }
+  digest:=sha256.Sum256([]byte(s.Name))
+  v:=managedListener{ID:fmt.Sprintf("service-%x",digest[:8]),Address:managedAddress(s.Addr),Network:managedNetwork(lt,s),Scope:"local",Kind:ht+"+"+lt,State:"starting",CounterScope:"native_listener_wrapped_bytes;SOCKS5_UDP_payload_direction_normalized;includes_control_bytes",ConnectionScope:r.ConnectionScope}
+  remote:=lt=="rtcp"||lt=="rudp"||lt=="runix"
+  if remote && s.Listener!=nil && (s.Listener.Chain!="" || s.Listener.ChainGroup!=nil) { v.Scope="remote" }
+  if inspect { v.State="configured" } else if srv:=registry.ServiceRegistry().Get(s.Name); srv!=nil {
+   if st,ok:=srv.(interface{Status() *xservice.Status}); ok {
+    switch st.Status().State() {
+    case xservice.StateReady: v.State="listening"
+    case xservice.StateFailed: v.State="failed"; v.Error="native listener accept or bind failed"
+    case xservice.StateClosed: v.State="closed"
+    default: v.State="starting"
+    }
+   } else { v.State="unknown" }
+   if remote {
+    // Native remote listeners bind lazily inside Accept. StateReady alone
+    // is not bind evidence; only the actual underlying bound listener is.
+    if bound,ok:=srv.(interface{ManagedBoundAddr() net.Addr}); ok {
+     if addr:=bound.ManagedBoundAddr(); addr!=nil { v.ActualAddress=managedAddress(addr.String()) } else if v.State=="listening" { v.State="starting" }
+    } else if v.State=="listening" { v.State="unknown" }
+   } else if v.State=="listening" {
+    if addr:=srv.Addr(); addr!=nil { v.ActualAddress=managedAddress(addr.String()) }
+    // Some native listeners return their declaration instead of socket addr.
+    if _,port,err:=net.SplitHostPort(v.ActualAddress); err==nil && port=="0" { v.ActualAddress="" }
+   }
+   supported:=loader.ManagedMetricService(s)
+   counts,ok:=xmetrics.ManagedSnapshot(s.Name)
+   v.Available=ok&&supported
+   if v.Available { v.Upload=counts.Upload;v.Download=counts.Download;v.Active=counts.Active;v.Total=counts.Total;v.Failed=counts.Failed }
+  }
+  if v.State=="listening" { ready++ }
+  if v.State=="failed"||v.State=="closed" { degraded=true }
+  r.Available=r.Available&&v.Available
+  r.Upload+=v.Upload;r.Download+=v.Download;r.Active+=v.Active;r.Total+=v.Total;r.Failed+=v.Failed
+  r.Listeners=append(r.Listeners,v)
+ }
+ if !inspect {
+  if degraded { r.State="degraded" } else if len(r.Listeners)>0&&ready==len(r.Listeners) { r.State="ready" } else if ready>0 { r.State="running" }
+ }
+ if len(r.Listeners)==0 { r.Available=false }
+ if !inspect {
+  counts:=xmetrics.ManagedTotals()
+  r.Upload=counts.Upload;r.Download=counts.Download;r.Active=counts.Active;r.Total=counts.Total;r.Failed=counts.Failed
+  r.CounterScope="process_lifetime_instrumented_native_wrappers_including_retired_services;SOCKS5_UDP_direction_normalized"
+ }
+ return r
+}
+func managedAddress(v string) string {
+ if len(v)>512 || strings.ContainsAny(v,"\x00\r\n@?#") || strings.Contains(v,"://") { return "" }
+ return v
+}
+func managedNetwork(kind string,s *config.ServiceConfig) string {
+ switch kind {
+ case "udp","rudp","kcp","quic","http3","h3","wt","dtls","redu": return "udp"
+ case "unix","runix": return "unix"
+ case "tun","tap","tungo","icmp","icmp6","porty": return "other"
+ case "dns":
+  if s.Listener!=nil { for k,v:=range s.Listener.Metadata { if strings.EqualFold(k,"mode") { switch strings.ToLower(fmt.Sprint(v)) { case "tcp","tls","https":return "tcp" } } } }
+  return "udp"
+ default:return "tcp"
+ }
+}

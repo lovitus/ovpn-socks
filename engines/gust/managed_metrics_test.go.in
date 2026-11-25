@@ -1,0 +1,36 @@
+package metrics
+
+import (
+ "fmt"
+ "testing"
+ coremetrics "github.com/go-gost/core/metrics"
+)
+
+func TestManagedIndependentBoundedCounters(t *testing.T) {
+ managedData.Lock(); originalCounts,originalEnabled:=managedData.counts,managedData.enabled;managedData.counts=make(map[string]*ManagedCounts);managedData.enabled=false;managedData.Unlock()
+ nativeEnabled:=IsEnabled()
+ defer func(){ managedData.Lock();managedData.counts=originalCounts;managedData.enabled=originalEnabled;managedData.Unlock();Enable(nativeEnabled) }()
+ Enable(false)
+ clientSeries:=func() int { families,err:=Registry().Gather();if err!=nil { t.Fatal(err) };count:=0;for _,f:=range families { for _,m:=range f.Metric { for _,label:=range m.Label { if label.GetName()=="client" {count++} } } };return count }
+ baseline:=clientSeries()
+ ManagedEnable()
+ if !ManagedTrack("test") { t.Fatal("track") }
+ labels:=coremetrics.Labels{"service":"test","client":"sensitive-client"}
+ GetCounter(MetricServiceTransferInputBytesCounter,labels).Add(17)
+ GetCounter(MetricServiceTransferOutputBytesCounter,labels).Add(23)
+ ManagedPacketCounter(true,MetricServiceTransferInputBytesCounter,labels).Add(5)
+ ManagedPacketCounter(true,MetricServiceTransferOutputBytesCounter,labels).Add(7)
+ GetCounter(MetricServiceRequestsCounter,labels).Inc()
+ gauge:=GetGauge(MetricServiceRequestsInFlightGauge,labels);gauge.Inc();gauge.Dec()
+ p,ok:=ManagedSnapshot("test")
+ if !ok || p.Upload!=24 || p.Download!=28 || p.Total!=1 || p.Active!=0 { t.Fatalf("counts: %+v",p) }
+ if IsEnabled() { t.Fatal("private telemetry enabled public metrics") }
+ // 10k distinct client labels must not create any native Prometheus series.
+ for i:=0;i<10000;i++ { GetCounter(MetricServiceRequestsCounter,coremetrics.Labels{"service":"test","client":fmt.Sprint(i)}).Inc() }
+ if clientSeries()!=baseline { t.Fatal("private collection created native client series") }
+ for i:=0;i<255;i++ { if !ManagedTrack(fmt.Sprint(i)) { t.Fatal("early capacity") } }
+ if ManagedTrack("overflow") { t.Fatal("unbounded cardinality") }
+ if !ManagedTrack("test") { t.Fatal("existing series lost at limit") }
+ p,_=ManagedSnapshot("test")
+ if p.Total!=10001 { t.Fatalf("counters not cumulative: %+v",p) }
+}

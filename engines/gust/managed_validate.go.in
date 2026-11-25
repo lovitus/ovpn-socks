@@ -1,0 +1,45 @@
+// Added by ovpn-socks. Structural validation only: no constructors, TLS
+// generation, network, plugins, user hooks or authentication file creation.
+package loader
+
+import (
+ "fmt"
+ "os"
+ "strings"
+ "github.com/go-gost/x/config"
+ "github.com/go-gost/x/registry"
+ xmetrics "github.com/go-gost/x/metrics"
+)
+
+func ManagedValidate(cfg *config.Config) error {
+ if cfg == nil { return fmt.Errorf("managed mode requires a configuration") }
+ if len(cfg.Services) > 256 { return fmt.Errorf("managed mode supports at most 256 listeners") }
+ if err := validateTopLevelNames(cfg); err != nil { return fmt.Errorf("invalid or duplicate native component names") }
+ for i, svc := range cfg.Services {
+  if svc == nil || strings.TrimSpace(svc.Name) == "" { return fmt.Errorf("service %d requires a name",i) }
+  if len(svc.Name)>512 { return fmt.Errorf("service %d: name exceeds managed limit",i) }
+  normalizeService(svc)
+  if svc.Listener.Type == "stdio" || svc.Listener.Type == "serial" { return fmt.Errorf("service %d: stdio/serial listeners are unsupported in managed mode",i) }
+  if registry.ServiceFactoryRegistry().Get(svc.Listener.Type) != nil { return fmt.Errorf("service %d: standalone service factories are not supported in managed mode",i) }
+  if registry.ListenerRegistry().Get(svc.Listener.Type) == nil || registry.HandlerRegistry().Get(svc.Handler.Type) == nil { return fmt.Errorf("service %d: unknown native listener or handler",i) }
+  if len(svc.Addr) > 512 || strings.ContainsAny(svc.Addr,"\x00\r\n@?#") || strings.Contains(svc.Addr,"://") { return fmt.Errorf("service %d: unsupported managed bind address",i) }
+ }
+ if err := validateReferences(cfg); err != nil { return fmt.Errorf("undefined or invalid native component reference") }
+ return nil
+}
+func managedPrepare(cfg *config.Config) error {
+ if os.Getenv("OVPN_SOCKS_TELEMETRY_TOKEN") == "" { return nil }
+ if err := ManagedValidate(cfg); err != nil { return err }
+ for _, svc := range cfg.Services { if ManagedMetricService(svc) { xmetrics.ManagedTrack(svc.Name) } }
+ return nil
+}
+// Unknown counter paths are unavailable, rather than reported as measured zero.
+func ManagedMetricService(s *config.ServiceConfig) bool {
+ if s==nil { return false }
+ lt,ht:="tcp","auto"
+ if s.Listener!=nil && s.Listener.Type!="" { lt=s.Listener.Type }
+ if s.Handler!=nil && s.Handler.Type!="" { ht=s.Handler.Type }
+ switch lt { case "tcp","udp","tls","rtcp","rudp","unix","runix": default:return false }
+ switch ht { case "tcp","udp","auto","http","socks5","socks4","socks4a","forward": return true }
+ return false
+}

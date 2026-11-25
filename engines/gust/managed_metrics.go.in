@@ -1,0 +1,96 @@
+// Added by ovpn-socks; independent bounded telemetry, never an exporter.
+package metrics
+
+import (
+ "sync"
+ "github.com/go-gost/core/metrics"
+)
+
+// ManagedCounts are process-lifetime native request counters. Bytes are measured
+// at native wrappers, not a host interface or a VPN device.
+type ManagedCounts struct {
+ Upload uint64
+ Download uint64
+ Active int64
+ Total uint64
+ Failed uint64
+}
+var managedData = struct {
+ sync.Mutex
+ enabled bool
+ counts map[string]*ManagedCounts
+}{counts: make(map[string]*ManagedCounts)}
+
+func ManagedEnable() { managedData.Lock(); managedData.enabled = true; managedData.Unlock() }
+func ManagedTrack(name string) bool {
+ managedData.Lock(); defer managedData.Unlock()
+ if !managedData.enabled { return false }
+ if _, ok := managedData.counts[name]; ok { return true }
+ if len(managedData.counts) >= 256 { return false }
+ managedData.counts[name] = &ManagedCounts{}
+ return true
+}
+func ManagedSnapshot(name string) (ManagedCounts, bool) {
+ managedData.Lock(); defer managedData.Unlock()
+ p, ok := managedData.counts[name]
+ if !ok { return ManagedCounts{}, false }
+ return *p, true
+}
+func ManagedEnabled() bool {
+ managedData.Lock(); defer managedData.Unlock()
+ return managedData.enabled
+}
+func ManagedTotals() ManagedCounts {
+ managedData.Lock(); defer managedData.Unlock()
+ var total ManagedCounts
+ for _,p:=range managedData.counts { total.Upload+=p.Upload;total.Download+=p.Download;total.Active+=p.Active;total.Total+=p.Total;total.Failed+=p.Failed }
+ return total
+}
+func managedAdd(name string, kind metrics.MetricName, v float64, set bool) {
+ managedData.Lock(); defer managedData.Unlock()
+ p := managedData.counts[name]
+ if !managedData.enabled || p == nil { return }
+ switch kind {
+ case MetricServiceTransferInputBytesCounter: if v > 0 { p.Upload += uint64(v) }
+ case MetricServiceTransferOutputBytesCounter: if v > 0 { p.Download += uint64(v) }
+ case MetricServiceRequestsCounter: if v > 0 { p.Total += uint64(v) }
+ case MetricServiceHandlerErrorsCounter: if v > 0 { p.Failed += uint64(v) }
+ case MetricServiceRequestsInFlightGauge:
+  if set { p.Active = int64(v) } else { p.Active += int64(v) }
+ }
+}
+func managedTracked(name string) bool {
+ managedData.Lock(); defer managedData.Unlock()
+ _, ok := managedData.counts[name]
+ return managedData.enabled && ok
+}
+// GetCounter preserves native Prometheus enablement and labels. Private storage
+// never retains client labels and never calls destructive observer Stats.Get.
+func GetCounter(kind metrics.MetricName, labels metrics.Labels) metrics.Counter {
+ return ManagedPacketCounter(false, kind, labels)
+}
+func ManagedPacketCounter(upstream bool, kind metrics.MetricName, labels metrics.Labels) metrics.Counter {
+ native := nativeGetCounter(kind, labels)
+ name := labels["service"]
+ if !managedTracked(name) { return native }
+ privateKind := kind
+ if upstream {
+  if kind == MetricServiceTransferInputBytesCounter { privateKind = MetricServiceTransferOutputBytesCounter }
+  if kind == MetricServiceTransferOutputBytesCounter { privateKind = MetricServiceTransferInputBytesCounter }
+ }
+ return &managedCounter{Counter:native, service:name, kind:privateKind}
+}
+type managedCounter struct { metrics.Counter; service string; kind metrics.MetricName }
+func (c *managedCounter) Inc() { c.Add(1) }
+func (c *managedCounter) Add(v float64) { c.Counter.Add(v); managedAdd(c.service,c.kind,v,false) }
+func GetGauge(kind metrics.MetricName, labels metrics.Labels) metrics.Gauge {
+ native := nativeGetGauge(kind,labels)
+ name := labels["service"]
+ if !managedTracked(name) { return native }
+ return &managedGauge{Gauge:native,service:name,kind:kind}
+}
+type managedGauge struct { metrics.Gauge; service string; kind metrics.MetricName }
+func (g *managedGauge) Inc() { g.Add(1) }
+func (g *managedGauge) Dec() { g.Add(-1) }
+func (g *managedGauge) Add(v float64) { g.Gauge.Add(v); managedAdd(g.service,g.kind,v,false) }
+func (g *managedGauge) Set(v float64) { g.Gauge.Set(v); managedAdd(g.service,g.kind,v,true) }

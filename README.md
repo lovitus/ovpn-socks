@@ -1,8 +1,8 @@
-# OVPN → SOCKS
+# OVPN → SOCKS · FlySSH · gust
 
-多连接 OpenVPN to SOCKS5 工具。纯 Go OpenVPN 协议引擎直接连接 gVisor 用户态 TCP/IP 栈，每个配置拥有独立的 SOCKS5 端口。
+轻量多连接管理工具，支持 OpenVPN、[lovitus/flyssh](https://github.com/lovitus/flyssh) 和 [lovitus/gust](https://github.com/lovitus/gust)。OpenVPN 引擎直接连接 gVisor 用户态 TCP/IP 栈，每个 VPN 配置拥有独立的 SOCKS5 端口；flyssh 和 gust 使用随发布包提供的独立原生进程，支持多监听、命令行参数和原生配置编辑。
 
-**客户端不创建系统 TAP/TUN，不安装驱动，不更改系统路由或 DNS，不需要管理员权限。** `.ovpn` 中的 `dev tun` 描述的是 OpenVPN 的 IP 数据包格式，程序只在内存中处理这些包。
+**OpenVPN 客户端不创建系统 TAP/TUN，不安装驱动，不更改系统路由或 DNS，不需要管理员权限。** flyssh / gust 按其原生命令和配置运行，默认使用宿主机网络；其监听不会自动接入某条 VPN。 `.ovpn` 中的 `dev tun` 描述的是 OpenVPN 的 IP 数据包格式，程序只在内存中处理这些包。
 
 ```text
 应用 / tun2socks → SOCKS5 → gVisor（每连接独立）→ OpenVPN 加密通道 → VPN 服务端
@@ -10,7 +10,7 @@
 
 ## 下载和运行
 
-从 GitHub Releases 下载与你的系统对应的可执行文件。Windows 下载 `ovpn-socks-windows-amd64.exe`，双击运行，浏览器会打开本机管理界面。
+从 GitHub Releases 下载与你的系统对应的压缩包并完整解压。Windows 双击 `ovpn-socks-windows-amd64.exe`，浏览器会打开本机管理界面。请保留同目录的 `engines/` 文件夹，其中包含 flyssh、gust 以及记录实际源码 commit 的 `manifest.json`。只复制主程序仍可使用 OpenVPN，但无法运行另外两个引擎。
 
 ```powershell
 .\ovpn-socks-windows-amd64.exe
@@ -25,7 +25,7 @@ chmod +x ovpn-socks-linux-amd64
 
 默认 Web 监听 `0.0.0.0:2080`。本机打开 `http://127.0.0.1:2080/`，远程打开 `http://服务器接口IP:2080/`。初始管理用户名和密码均为 **admin**，登录后通过右上角「账户设置」修改。账户设置持久保存，修改后所有旧会话失效，需要重新登录；重启不会重置账户。保持终端运行，按 Ctrl+C 退出。
 
-发布提供 Windows / Linux / macOS 的 amd64、arm64 六种独立可执行文件。macOS Intel 选择 `darwin-amd64`，Apple Silicon 选择 `darwin-arm64`；Linux x86_64 选择 `linux-amd64`，ARM64 选择 `linux-arm64`。
+发布提供 Windows / Linux / macOS 的 amd64、arm64 六种便携包，每包包含对应平台的主程序与两个引擎。macOS Intel 选择 `darwin-amd64`，Apple Silicon 选择 `darwin-arm64`；Linux x86_64 选择 `linux-amd64`，ARM64 选择 `linux-arm64`。
 
 ```sh
 # Linux 服务器，覆盖默认 Web 端口
@@ -61,6 +61,19 @@ curl --socks5-hostname 127.0.0.1:1080 http://10.10.0.10/
 ```
 
 不同 VPN 即使使用相同私网段，也由各自独立的用户态栈和 SOCKS 端口隔离。离线后现有代理连接关闭，新的请求拒绝转发，不回退本机直连。
+
+## flyssh / gust 连接
+
+新建连接时选择引擎，输入命令行参数；可同时粘贴或上传原生配置。命令行按引号拆分为 argv，**不经过 shell**，不展开环境变量、命令替换或通配符；包含 `&` 等字符的 URL 请加引号。工作目录填写运行服务器上的绝对路径，用于相对密钥、证书等文件引用。内嵌配置会在运行时写入私有临时文件，停止或启动失败后清理。
+
+- **flyssh**：使用原生 SSH 参数和 SSH Config 子集。例如 `-N --no-reconnect -L 127.0.0.1:18080:127.0.0.1:80 -D 127.0.0.1:11080 user@ssh-host`。支持多个 `-L` / `-D` / `-R`，以及该 fork 的 `-ltcp://…` 语法。`-L tcp://…` 不是 SSH 的标准转发语法；`-R` 在 SSH 远端监听。托管模式用于转发服务，交互终端、文件传输等模式不适用。
+- **gust**：使用原生参数和 YAML / JSON。例如 `-L "tcp://127.0.0.1:18080/127.0.0.1:80" -L "udp://127.0.0.1:15353/192.0.2.53:53?keepalive=true&ttl=5s"`。支持多 `-L`、原生服务与转发配置。SOCKS5 UDP 示例为 `-L "socks5://user:password@127.0.0.1:11080?udp=true"`。
+- 配置文本不为空时自动添加 flyssh `-F` / gust `-C`。若参数中已有配置路径，需用 `{config}` 明确指定编辑器内容的位置，例如 `-C base.yaml -C {config}`，其余路径仍由原生引擎读取。
+- 「解析监听」调用同一构建中引擎自己的解析器，解析配置但不启动服务。声明中的 TCP / UDP、本地 / 远端地址会保留；运行后另显示实际绑定地址和状态。配置里的端口 `0` 只有在真实绑定成功后才有实际端口。
+
+引擎包含可选观测代码，普通单独运行不会开启。管理器通过私有 stdout 通道采集状态，不占用或更改用户的 API / metrics 端点。进程存活、SSH 已连接、服务已监听分别显示；超过观测时限显示状态未知。未覆盖的协议或指标显示「—」，不会把未知当作零。flyssh 转发统计实际成功写入的流量；gust 按原生服务计数，部分协议包含握手，界面注明口径，不能把所有请求都当作 TCP 连接或 UDP 五元组会话。
+
+**gust 的 UDP 能力属于 gust 连接。OpenVPN 自带 SOCKS 仍仅支持 TCP CONNECT；单独启动 gust 不会自动获得 VPN 内 UDP 出口。** gust 的 SOCKS5 UDP 关联随控制 TCP 关闭；独立 UDP 转发的空闲回收由原生 `ttl` / `keepalive.ttl` 控制，两者生命周期不同。
 
 ## 断线与自动重连
 
@@ -113,6 +126,15 @@ go vet ./...
 CGO_ENABLED=0 go build ./cmd/ovpn-socks
 (cd third_party/sing-openvpn && go test ./...)
 ```
+
+构建完整发行包还需将 `lovitus/flyssh`、`lovitus/gust`、`lovitus/gust-x` 的源码检出到同一目录的三个同名子目录，然后运行：
+
+```sh
+python3 scripts/build_engines.py --sources .engine-src --out dist/engines --prepare
+python3 scripts/build_engines.py --sources .engine-src --out dist/engines --os linux --arch amd64
+```
+
+`--prepare` 要求干净 checkout，应用明确标注的观测补丁并构建内嵌 relay；后续可连续构建不同平台。源码锚点变化会停止构建，避免上游升级后静默生成错误统计。发布 CI 每次检出默认分支最新 commit，并保存实际版本清单；安装后的应用不会自行拉取或编译源码。私有 gust-x 通过专用只读 deploy key 拉取，fork PR 不提供该密钥。开发运行时可设置绝对路径 `OVPN_SOCKS_ENGINE_DIR` 指向引擎目录。
 
 Actions 额外运行真实官方 OpenVPN 服务端的互操作测试：测试服务端可以使用临时 TUN（仅 GitHub Linux 测试 fixture），**被测客户端仍完全运行在用户态**。测试覆盖 SOCKS 到 VPN 内 HTTP、服务端推送路由/DNS、`tls-auth` / `tls-crypt`。本机普通单元测试不创建系统设备。
 

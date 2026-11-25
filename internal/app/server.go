@@ -15,12 +15,22 @@ import (
 	"time"
 
 	"github.com/lovitus/ovpn-socks/internal/config"
+	"github.com/lovitus/ovpn-socks/internal/engine"
 	"github.com/lovitus/ovpn-socks/internal/ovpnconfig"
 	"github.com/lovitus/ovpn-socks/internal/vpn"
 )
 
 //go:embed web/*
 var assets embed.FS
+
+// managedSession keeps profile lifecycle independent of its network engine.
+// Implementations return bounded snapshots and stop all owned resources.
+type managedSession interface {
+	Snapshot() vpn.Snapshot
+	Summary() vpn.Snapshot
+	Metrics() vpn.MetricsSnapshot
+	Stop()
+}
 
 type Server struct {
 	store        *config.Store
@@ -30,7 +40,7 @@ type Server struct {
 	authTokens   float64
 	authLast     time.Time
 	mu           sync.Mutex
-	sessions     map[string]*vpn.Session
+	sessions     map[string]managedSession
 	ctx          context.Context
 	cancel       context.CancelFunc
 	startedAt    time.Time
@@ -41,7 +51,7 @@ type Server struct {
 
 func New(store *config.Store, openvpn string) (*Server, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Server{startedAt: time.Now(), store: store, openvpn: openvpn, logins: map[string]time.Time{}, authTokens: 10, authLast: time.Now(), sessions: map[string]*vpn.Session{}, ctx: ctx, cancel: cancel}, nil
+	return &Server{startedAt: time.Now(), store: store, openvpn: openvpn, logins: map[string]time.Time{}, authTokens: 10, authLast: time.Now(), sessions: map[string]managedSession{}, ctx: ctx, cancel: cancel}, nil
 }
 func (s *Server) URL(addr string) string {
 	return "http://" + addr + "/"
@@ -93,6 +103,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case r.URL.Path == "/api/engines":
+		s.engines(w, r)
+	case r.URL.Path == "/api/engines/inspect":
+		s.inspectEngine(w, r)
 	case r.URL.Path == "/api/metrics":
 		s.metrics(w, r)
 	case r.URL.Path == "/api/profiles":
@@ -149,16 +163,19 @@ func decode(w http.ResponseWriter, r *http.Request, v any) error {
 }
 
 type view struct {
-	ID            string       `json:"id"`
-	Name          string       `json:"name"`
-	Username      string       `json:"username"`
-	Listen        string       `json:"listen"`
-	AutoConnect   bool         `json:"auto_connect"`
-	AutoReconnect bool         `json:"auto_reconnect"`
-	TOTPMode      string       `json:"totp_mode"`
-	HasPassword   bool         `json:"has_password"`
-	HasTOTP       bool         `json:"has_totp"`
-	Status        vpn.Snapshot `json:"status"`
+	ID            string               `json:"id"`
+	Name          string               `json:"name"`
+	Username      string               `json:"username"`
+	Listen        string               `json:"listen"`
+	AutoConnect   bool                 `json:"auto_connect"`
+	AutoReconnect bool                 `json:"auto_reconnect"`
+	TOTPMode      string               `json:"totp_mode"`
+	HasPassword   bool                 `json:"has_password"`
+	HasTOTP       bool                 `json:"has_totp"`
+	Status        vpn.Snapshot         `json:"status"`
+	Engine        string               `json:"engine"`
+	Listeners     []config.Listener    `json:"listeners,omitempty"`
+	EngineStatus  *engine.EngineStatus `json:"engine_status,omitempty"`
 }
 
 func (s *Server) describe(p config.Profile) view {
@@ -166,9 +183,15 @@ func (s *Server) describe(p config.Profile) view {
 }
 func (s *Server) describeSummary(p config.Profile, summary bool) view {
 	v := view{ID: p.ID, Name: p.Name, Username: p.Username, Listen: p.Listen, AutoConnect: p.AutoConnect, AutoReconnect: p.AutoReconnect, TOTPMode: p.TOTPMode, HasPassword: p.Password != "", HasTOTP: p.TOTPSeed != "", Status: vpn.Snapshot{ID: p.ID, State: "stopped", Listen: p.Listen}}
+	v.Engine = p.EngineName()
+	v.Listeners = p.Listeners
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if session := s.sessions[p.ID]; session != nil {
+		if external, ok := session.(interface{ EngineStatus() engine.EngineStatus }); ok {
+			state := external.EngineStatus()
+			v.EngineStatus = &state
+		}
 		if summary {
 			v.Status = session.Summary()
 		} else {
@@ -222,11 +245,35 @@ func (s *Server) profiles(w http.ResponseWriter, r *http.Request) {
 			input.TOTPSeed = ""
 			input.TOTPMode = ""
 		}
-		if _, err := ovpnconfig.Parse(input.OVPN); err != nil {
-			fail(w, 400, err)
+		if input.EngineName() == "openvpn" {
+			input.Listeners = nil
+			if _, err := ovpnconfig.Parse(input.OVPN); err != nil {
+				fail(w, 400, err)
+				return
+			}
+		} else {
+			result, err := engine.Inspect(r.Context(), engineOptions(input.Profile))
+			if err != nil {
+				fail(w, 400, err)
+				return
+			}
+			input.Listeners = listenerDeclarations(result.Listeners)
+		}
+		s.mu.Lock()
+		if input.ID != "" {
+			if _, exists := s.store.Get(input.ID); !exists {
+				s.mu.Unlock()
+				fail(w, 404, errors.New("配置已删除"))
+				return
+			}
+		}
+		if input.ID != "" && s.sessions[input.ID] != nil {
+			s.mu.Unlock()
+			fail(w, 409, errors.New("连接已启动，请先停止连接再编辑配置"))
 			return
 		}
 		p, err := s.store.Save(input.Profile)
+		s.mu.Unlock()
 		if err != nil {
 			fail(w, 400, err)
 			return
@@ -295,8 +342,9 @@ func (s *Server) profile(w http.ResponseWriter, r *http.Request) {
 			session.Stop()
 			delete(s.sessions, id)
 		}
+		err := s.store.Delete(id)
 		s.mu.Unlock()
-		if err := s.store.Delete(id); err != nil {
+		if err != nil {
 			fail(w, 500, err)
 			return
 		}
@@ -308,8 +356,21 @@ func (s *Server) profile(w http.ResponseWriter, r *http.Request) {
 func (s *Server) start(p config.Profile) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	latest, ok := s.store.Get(p.ID)
+	if !ok {
+		return errors.New("配置不存在")
+	}
+	p = latest
 	if s.sessions[p.ID] != nil {
 		return errors.New("连接已启动，请先停止再重启")
+	}
+	if p.EngineName() != "openvpn" {
+		session, err := engine.Start(s.ctx, engineOptions(p))
+		if err != nil {
+			return err
+		}
+		s.sessions[p.ID] = session
+		return nil
 	}
 	session, err := vpn.Start(s.ctx, vpn.Options{ID: p.ID, Name: p.Name, Config: p.OVPN, Username: p.Username, Listen: p.Listen, OpenVPNPath: s.openvpn, AutoReconnect: p.AutoReconnect, Password: func() (string, error) { return p.AuthPassword(time.Now()) }})
 	if err != nil {

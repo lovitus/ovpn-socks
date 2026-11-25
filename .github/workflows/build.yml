@@ -22,6 +22,9 @@ jobs:
           cache: true
       - run: go test -count=1 ./...
       - run: go vet ./...
+      - name: Check concurrent counters and reconnect snapshots
+        if: runner.os == 'Linux'
+        run: go test -race -count=1 ./internal/proxy ./internal/vpn ./internal/routeexport
       - name: Test upstream credential callback patch
         working-directory: third_party/sing-openvpn
         run: go test -count=1 ./...

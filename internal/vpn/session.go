@@ -24,14 +24,15 @@ type Options struct {
 	Password                                        func() (string, error)
 }
 type Snapshot struct {
-	ID       string   `json:"id"`
-	State    string   `json:"state"`
-	Listen   string   `json:"listen"`
-	Routes   []string `json:"routes"`
-	DNS      []string `json:"dns"`
-	Logs     []string `json:"logs"`
-	Error    string   `json:"error"`
-	TunnelIP string   `json:"tunnel_ip"`
+	ID       string         `json:"id"`
+	State    string         `json:"state"`
+	Listen   string         `json:"listen"`
+	Routes   []string       `json:"routes"`
+	DNS      []string       `json:"dns"`
+	Logs     []string       `json:"logs"`
+	Error    string         `json:"error"`
+	TunnelIP string         `json:"tunnel_ip"`
+	Metrics  MetricsSummary `json:"metrics"`
 }
 type Session struct {
 	opts       Options
@@ -39,6 +40,7 @@ type Session struct {
 	cancel     context.CancelFunc
 	mu         sync.RWMutex
 	snapshot   Snapshot
+	metrics    sessionMetrics
 	client     *openvpn.Client
 	network    *proxy.Network
 	networkKey string
@@ -57,7 +59,10 @@ func Start(ctx context.Context, opts Options) (*Session, error) {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	s := &Session{opts: opts, ctx: ctx, cancel: cancel, done: make(chan struct{}), snapshot: Snapshot{ID: opts.ID, State: "connecting", Routes: []string{}, DNS: []string{}, Logs: []string{}}}
+	s.metrics.started = time.Now()
 	parsed.Context = ctx
+	// Bound remote TCP establishment when a route silently drops packets.
+	parsed.Transport.DialContext = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
 	parsed.DisableReconnect = !opts.AutoReconnect
 	parsed.Authentication.Username = opts.Username
 	parsed.Authentication.Password = ""
@@ -105,13 +110,21 @@ func Start(ctx context.Context, opts Options) (*Session, error) {
 	go s.monitor()
 	return s, nil
 }
-func (s *Session) Snapshot() Snapshot {
+func (s *Session) Snapshot() Snapshot { return s.snapshotCopy(true) }
+
+// Summary omits log copying for frequent profile-list refreshes.
+func (s *Session) Summary() Snapshot { return s.snapshotCopy(false) }
+func (s *Session) snapshotCopy(logs bool) Snapshot {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	v := s.snapshot
 	v.Routes = append([]string{}, v.Routes...)
 	v.DNS = append([]string{}, v.DNS...)
-	v.Logs = append([]string{}, v.Logs...)
+	v.Logs = nil
+	if logs {
+		v.Logs = append([]string{}, s.snapshot.Logs...)
+	}
+	v.Metrics = s.metricsCurrentLocked(time.Now())
 	return v
 }
 func (s *Session) Stop() {
@@ -122,7 +135,7 @@ func (s *Session) Stop() {
 		s.server.Close()
 		<-s.done
 		s.mu.Lock()
-		s.snapshot.State = "stopped"
+		s.setStateLocked("stopped", time.Now())
 		s.snapshot.TunnelIP = ""
 		s.mu.Unlock()
 		s.addLog("stopped")
@@ -195,7 +208,7 @@ func (s *Session) configure(event openvpn.TunnelConfigurationEvent) error {
 	old := s.network
 	if !preserve {
 		s.network = nil
-		s.snapshot.State = "connecting"
+		s.setStateLocked("connecting", time.Now())
 	}
 	s.mu.Unlock()
 	if !preserve {
@@ -274,7 +287,7 @@ func (s *Session) monitor() {
 		s.server.Close()
 		if s.ctx.Err() != nil {
 			s.mu.Lock()
-			s.snapshot.State = "stopped"
+			s.setStateLocked("stopped", time.Now())
 			s.mu.Unlock()
 		}
 	}()
@@ -285,7 +298,8 @@ func (s *Session) monitor() {
 		select {
 		case <-s.ctx.Done():
 			return
-		case <-ticker.C:
+		case now := <-ticker.C:
+			s.sampleMetrics(now)
 		}
 		ready := s.client.Ready()
 		s.mu.RLock()
@@ -293,7 +307,7 @@ func (s *Session) monitor() {
 		s.mu.RUnlock()
 		if ready && n != nil && n.Err() == nil {
 			s.mu.Lock()
-			s.snapshot.State = "connected"
+			s.setStateLocked("connected", time.Now())
 			s.snapshot.Error = ""
 			s.mu.Unlock()
 			wasReady = true
@@ -308,13 +322,13 @@ func (s *Session) monitor() {
 			wasReady = false
 			s.dropNetwork()
 			s.mu.Lock()
-			s.snapshot.State = "reconnecting"
+			s.setStateLocked("reconnecting", time.Now())
 			s.mu.Unlock()
 			s.addLog("VPN disconnected; existing SOCKS connections closed")
 			if !s.opts.AutoReconnect {
 				s.client.Close()
 				s.mu.Lock()
-				s.snapshot.State = "disconnected"
+				s.setStateLocked("disconnected", time.Now())
 				s.mu.Unlock()
 				return
 			}
@@ -324,7 +338,8 @@ func (s *Session) monitor() {
 			s.dropNetwork()
 			if !s.opts.AutoReconnect {
 				s.mu.Lock()
-				s.snapshot.State, s.snapshot.Error = "error", n.Err().Error()
+				s.setStateLocked("error", time.Now())
+				s.snapshot.Error = n.Err().Error()
 				s.mu.Unlock()
 				return
 			}
@@ -335,7 +350,7 @@ func (s *Session) monitor() {
 		cancel()
 		if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
 			s.mu.Lock()
-			s.snapshot.State = "error"
+			s.setStateLocked("error", time.Now())
 			s.snapshot.Error = err.Error()
 			s.mu.Unlock()
 			s.dropNetwork()

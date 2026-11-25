@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"math/big"
+	"math/rand/v2"
 	"net"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ import (
 const (
 	clientReconnectInitialBackoff = time.Second
 	clientReconnectMaximumBackoff = 60 * time.Second
+	clientReconnectStableDuration = 60 * time.Second
 )
 
 var errClientSessionConfiguration = E.New("client session configuration error")
@@ -249,6 +251,7 @@ func (c *Client) runSupervisor(ctx context.Context) {
 		}
 		remote := c.remotes[cursor.remoteIndex]
 		remote.addressIndex = cursor.addressIndex
+		c.noteReconnectAttempt(time.Now())
 		var session clientSession
 		session, err = c.newClientSession(!firstSession, remote)
 		var stopSessionOnContextDone func() bool
@@ -281,6 +284,7 @@ func (c *Client) runSupervisor(ctx context.Context) {
 				backoff = clientReconnectInitialBackoff
 				continue
 			}
+			c.noteReconnectFailure(err, false)
 			if c.options.DisableReconnect {
 				c.setTerminalError(err)
 				return
@@ -298,15 +302,16 @@ func (c *Client) runSupervisor(ctx context.Context) {
 				return
 			}
 			cursor = c.nextConnectionCursor(cursor, err, false)
-			backoff = applyClientSessionErrorBackoff(err, backoff)
+			delay := clientReconnectDelay(err, backoff)
+			c.noteReconnectBackoff(delay)
 			if c.options.Logger != nil {
 				if errors.Is(err, errClientSessionConfiguration) {
-					c.options.Logger.ErrorContext(ctx, "session with ", remote.address, " over ", remote.remote.Protocol, " failed; retrying in ", backoff, ": ", err)
+					c.options.Logger.ErrorContext(ctx, "session with ", remote.address, " over ", remote.remote.Protocol, " failed; retrying in ", delay, ": ", err)
 				} else {
-					c.options.Logger.DebugContext(ctx, "session with ", remote.address, " over ", remote.remote.Protocol, " failed; retrying in ", backoff, ": ", err)
+					c.options.Logger.DebugContext(ctx, "session with ", remote.address, " over ", remote.remote.Protocol, " failed; retrying in ", delay, ": ", err)
 				}
 			}
-			if !waitClientReconnectBackoff(ctx, backoff) {
+			if !waitClientReconnectBackoff(ctx, delay) {
 				return
 			}
 			backoff = min(backoff*2, clientReconnectMaximumBackoff)
@@ -319,13 +324,17 @@ func (c *Client) runSupervisor(ctx context.Context) {
 				c.options.Logger.InfoContext(ctx, "tunnel re-established to ", remote.address, " over ", remote.remote.Protocol)
 			}
 		}
+		connectedSince := time.Now()
+		c.noteReconnectConnected(connectedSince, firstSession)
 		firstSession = false
-		backoff = clientReconnectInitialBackoff
 		c.clearPreviousAuthFailure()
 		if c.isSuspended() {
 			session.Fail(ErrClientSuspended)
 		}
 		sessionErr := <-session.Done()
+		connectedFor := time.Since(connectedSince)
+		stable := connectedFor >= clientReconnectStableDuration
+		backoff = clientReconnectBackoffAfterSession(backoff, connectedFor)
 		stopSessionOnContextDone()
 		_ = session.Close()
 		c.clearCurrentSession(session)
@@ -339,6 +348,7 @@ func (c *Client) runSupervisor(ctx context.Context) {
 		if sessionErr == nil {
 			return
 		}
+		c.noteReconnectFailure(sessionErr, stable)
 		if c.options.DisableReconnect {
 			c.setTerminalError(sessionErr)
 			return
@@ -356,15 +366,16 @@ func (c *Client) runSupervisor(ctx context.Context) {
 			return
 		}
 		cursor = c.nextConnectionCursor(cursor, sessionErr, true)
-		backoff = applyClientSessionErrorBackoff(sessionErr, backoff)
+		delay := clientReconnectDelay(sessionErr, backoff)
+		c.noteReconnectBackoff(delay)
 		if c.options.Logger != nil {
 			if errors.Is(sessionErr, errClientSessionConfiguration) {
-				c.options.Logger.ErrorContext(ctx, "session with ", remote.address, " over ", remote.remote.Protocol, " ended; retrying in ", backoff, ": ", sessionErr)
+				c.options.Logger.ErrorContext(ctx, "session with ", remote.address, " over ", remote.remote.Protocol, " ended; retrying in ", delay, ": ", sessionErr)
 			} else {
-				c.options.Logger.DebugContext(ctx, "session with ", remote.address, " over ", remote.remote.Protocol, " ended; retrying in ", backoff, ": ", sessionErr)
+				c.options.Logger.DebugContext(ctx, "session with ", remote.address, " over ", remote.remote.Protocol, " ended; retrying in ", delay, ": ", sessionErr)
 			}
 		}
-		if !waitClientReconnectBackoff(ctx, backoff) {
+		if !waitClientReconnectBackoff(ctx, delay) {
 			return
 		}
 		backoff = min(backoff*2, clientReconnectMaximumBackoff)
@@ -391,6 +402,27 @@ func waitClientReconnectBackoff(ctx context.Context, backoff time.Duration) bool
 	case <-timer.C:
 		return true
 	}
+}
+
+// A short-lived successful connection must not turn a flapping network into
+// an endless sequence of one-second retries. Count stability after Start.
+func clientReconnectBackoffAfterSession(backoff, connectedFor time.Duration) time.Duration {
+	if connectedFor >= clientReconnectStableDuration {
+		return clientReconnectInitialBackoff
+	}
+	return backoff
+}
+
+func clientReconnectDelay(err error, backoff time.Duration) time.Duration {
+	// Jitter the local schedule, then apply the server's minimum. Keep the
+	// exponential base independent of both jitter and server-directed delays.
+	return clientReconnectDelayWithJitter(err, backoff, rand.Float64())
+}
+
+func clientReconnectDelayWithJitter(err error, backoff time.Duration, sample float64) time.Duration {
+	delay := time.Duration(float64(backoff) * (0.8 + 0.4*sample))
+	delay = min(delay, clientReconnectMaximumBackoff)
+	return applyClientSessionErrorBackoff(err, delay)
 }
 
 func applyClientSessionErrorBackoff(err error, backoff time.Duration) time.Duration {

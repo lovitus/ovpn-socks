@@ -22,6 +22,7 @@ type Server struct {
 	mu       sync.Mutex
 	conns    map[net.Conn]struct{}
 	wg       sync.WaitGroup
+	metrics  Counters
 }
 
 func Listen(address string, dial DialFunc) (*Server, error) {
@@ -85,6 +86,12 @@ func (s *Server) accept() {
 	}
 }
 func (s *Server) serve(c net.Conn) {
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			s.metrics.failed.Add(1)
+		}
+	}()
 	c.SetDeadline(time.Now().Add(15 * time.Second))
 	var h [4]byte
 	if _, err := io.ReadFull(c, h[:2]); err != nil || h[0] != 5 || h[1] == 0 {
@@ -110,10 +117,7 @@ func (s *Server) serve(c net.Conn) {
 	if _, err := io.ReadFull(c, h[:]); err != nil || h[0] != 5 || h[2] != 0 {
 		return
 	}
-	if h[1] != 1 {
-		reply(c, 7, nil)
-		return
-	} // UDP ASSOCIATE and BIND are explicitly unsupported.
+	command := h[1]
 	var host string
 	switch h[3] {
 	case 1:
@@ -144,32 +148,45 @@ func (s *Server) serve(c net.Conn) {
 	if _, err := io.ReadFull(c, h[:2]); err != nil {
 		return
 	}
+	// Consume the entire bounded request before rejecting a command. Closing
+	// TCP with the address/port unread can send RST (notably on Windows),
+	// discarding the error reply before the client receives it.
+	if command != 1 {
+		reply(c, 7, nil)
+		return
+	} // UDP ASSOCIATE and BIND are explicitly unsupported.
 	port := binary.BigEndian.Uint16(h[:2])
 	if port == 0 {
 		reply(c, 2, nil)
 		return
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, 20*time.Second)
+	started := time.Now()
 	up, err := s.dial(ctx, net.JoinHostPort(host, strconv.Itoa(int(port))))
+	s.metrics.dialed(time.Since(started))
 	cancel()
 	if err != nil {
 		reply(c, 4, nil)
 		return
 	}
 	defer up.Close()
+	succeeded = true
+	s.metrics.succeeded.Add(1)
+	s.metrics.opened()
+	defer s.metrics.active.Add(-1)
 	reply(c, 0, up.LocalAddr())
 	c.SetDeadline(time.Time{})
 	stop := context.AfterFunc(s.ctx, func() { up.Close(); c.Close() })
 	defer stop()
 	done := make(chan struct{})
 	go func() {
-		io.Copy(up, c)
+		io.Copy(countingWriter{up, &s.metrics.upload}, c)
 		if t, ok := up.(interface{ CloseWrite() error }); ok {
 			t.CloseWrite()
 		}
 		close(done)
 	}()
-	io.Copy(c, up)
+	io.Copy(countingWriter{c, &s.metrics.download}, up)
 	c.Close()
 	up.Close()
 	<-done

@@ -23,21 +23,25 @@ import (
 var assets embed.FS
 
 type Server struct {
-	store      *config.Store
-	openvpn    string
-	authMu     sync.Mutex
-	logins     map[string]time.Time
-	authTokens float64
-	authLast   time.Time
-	mu         sync.Mutex
-	sessions   map[string]*vpn.Session
-	ctx        context.Context
-	cancel     context.CancelFunc
+	store        *config.Store
+	openvpn      string
+	authMu       sync.Mutex
+	logins       map[string]time.Time
+	authTokens   float64
+	authLast     time.Time
+	mu           sync.Mutex
+	sessions     map[string]*vpn.Session
+	ctx          context.Context
+	cancel       context.CancelFunc
+	startedAt    time.Time
+	runtimeMu    sync.Mutex
+	runtimeAt    time.Time
+	runtimeStats runtimeStats
 }
 
 func New(store *config.Store, openvpn string) (*Server, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Server{store: store, openvpn: openvpn, logins: map[string]time.Time{}, authTokens: 10, authLast: time.Now(), sessions: map[string]*vpn.Session{}, ctx: ctx, cancel: cancel}, nil
+	return &Server{startedAt: time.Now(), store: store, openvpn: openvpn, logins: map[string]time.Time{}, authTokens: 10, authLast: time.Now(), sessions: map[string]*vpn.Session{}, ctx: ctx, cancel: cancel}, nil
 }
 func (s *Server) URL(addr string) string {
 	return "http://" + addr + "/"
@@ -89,6 +93,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case r.URL.Path == "/api/metrics":
+		s.metrics(w, r)
 	case r.URL.Path == "/api/profiles":
 		s.profiles(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/profiles/"):
@@ -156,11 +162,18 @@ type view struct {
 }
 
 func (s *Server) describe(p config.Profile) view {
+	return s.describeSummary(p, false)
+}
+func (s *Server) describeSummary(p config.Profile, summary bool) view {
 	v := view{ID: p.ID, Name: p.Name, Username: p.Username, Listen: p.Listen, AutoConnect: p.AutoConnect, AutoReconnect: p.AutoReconnect, TOTPMode: p.TOTPMode, HasPassword: p.Password != "", HasTOTP: p.TOTPSeed != "", Status: vpn.Snapshot{ID: p.ID, State: "stopped", Listen: p.Listen}}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if session := s.sessions[p.ID]; session != nil {
-		v.Status = session.Snapshot()
+		if summary {
+			v.Status = session.Summary()
+		} else {
+			v.Status = session.Snapshot()
+		}
 	}
 	return v
 }
@@ -169,7 +182,7 @@ func (s *Server) profiles(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		result := []view{}
 		for _, p := range s.store.List() {
-			result = append(result, s.describe(p))
+			result = append(result, s.describeSummary(p, r.URL.Query().Get("summary") == "1"))
 		}
 		writeJSON(w, result)
 	case http.MethodPost:
@@ -236,11 +249,22 @@ func (s *Server) profile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(parts) == 2 {
+		if parts[1] == "status" {
+			if r.Method != http.MethodGet {
+				fail(w, 405, errors.New("method not allowed"))
+				return
+			}
+			writeJSON(w, s.describe(p).Status)
+			return
+		}
 		if r.Method != http.MethodPost {
 			fail(w, 405, errors.New("method not allowed"))
 			return
 		}
 		switch parts[1] {
+		case "export":
+			s.exportRoutes(w, r, p)
+			return
 		case "start":
 			if err := s.start(p); err != nil {
 				fail(w, 400, err)

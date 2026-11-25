@@ -78,6 +78,53 @@ func TestSOCKSOfflineFailsClosedAndUDPUnsupported(t *testing.T) {
 		t.Fatalf("unsupported commands dialed: %d", count.Load())
 	}
 }
+
+// net.Pipe makes the regression deterministic: the client cannot finish its
+// request write unless the server consumes all address and port bytes before
+// writing the rejection. TCP buffering otherwise makes this failure intermittent.
+func TestSOCKSUnsupportedCommandConsumesRequest(t *testing.T) {
+	for _, command := range []byte{2, 3} {
+		for _, address := range [][]byte{
+			{1, 127, 0, 0, 1},
+			{3, 3, 'v', 'p', 'n'},
+			append([]byte{4}, make([]byte, 16)...),
+		} {
+			func() {
+				client, server := net.Pipe()
+				defer client.Close()
+				client.SetDeadline(time.Now().Add(2 * time.Second))
+				s := &Server{ctx: context.Background(), dial: func(context.Context, string) (net.Conn, error) {
+					t.Error("unsupported command reached dialer")
+					return nil, errors.New("unexpected dial")
+				}}
+				done := make(chan struct{})
+				go func() { defer close(done); defer server.Close(); s.serve(server) }()
+				defer func() { client.Close(); <-done }()
+				if _, err := client.Write([]byte{5, 1, 0}); err != nil {
+					t.Fatal(err)
+				}
+				var greeting [2]byte
+				if _, err := io.ReadFull(client, greeting[:]); err != nil {
+					t.Fatal(err)
+				}
+				message := append([]byte{5, command, 0}, address...)
+				message = append(message, 0, 0) // UDP commonly requests a zero port.
+				if _, err := client.Write(message); err != nil {
+					t.Fatalf("command %d request not consumed: %v", command, err)
+				}
+				var response [10]byte
+				if _, err := io.ReadFull(client, response[:]); err != nil || response[1] != 7 {
+					t.Fatalf("command %d reply %v: %v", command, response, err)
+				}
+				<-done
+				if m := s.Metrics(); m.RequestsFailed != 1 || m.DialCount != 0 {
+					t.Fatalf("rejected request metrics: %+v", m)
+				}
+			}()
+		}
+	}
+}
+
 func TestSOCKSInterfaceListeners(t *testing.T) {
 	for _, address := range []string{"0.0.0.0:0", ":0", "127.0.0.1:0"} {
 		s, err := Listen(address, func(context.Context, string) (net.Conn, error) { return nil, errors.New("offline") })

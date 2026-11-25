@@ -35,6 +35,7 @@ type clientLifecycle struct {
 	dataReadDone     chan struct{}
 	dataReadStopped  bool
 	closeErr         error
+	reconnect        ReconnectStatus
 }
 
 type clientAuthenticationSession struct {

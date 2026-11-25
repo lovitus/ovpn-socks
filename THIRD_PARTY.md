@@ -6,7 +6,7 @@
 - Pinned upstream commit: `d1e498f993a04d705024b41f9477a8d8936e7cc3`
 - License: GPL-3.0-or-later (see `third_party/sing-openvpn/LICENSE`).
 - Source is included under `third_party/sing-openvpn` and selected by the root `go.mod` replace directive. It is used as an in-process userspace OpenVPN protocol library; no external OpenVPN process or device driver is required.
-- Local changes: an optional credentials callback refreshes TOTP at each password-based TLS key exchange, and an optional DisableReconnect setting implements the profile's manual reconnect choice. See `third_party/sing-openvpn/PATCHES.md` for exact behavior and test coverage.
+- Local changes: an optional credentials callback refreshes TOTP at each password-based TLS key exchange, an optional DisableReconnect setting implements the profile's manual reconnect choice, and reconnect backoff now uses a stable-connection reset threshold, bounded jitter, and a thread-safe status snapshot. See `third_party/sing-openvpn/PATCHES.md` for exact behavior and test coverage.
 - Vendored subset includes library Go source, `proto`, module metadata, license, and tests for local modifications. Upstream's larger reference test fixture suite is not vendored. This application's integration tests run a real official OpenVPN server separately.
 
 ## Userspace TCP/IP

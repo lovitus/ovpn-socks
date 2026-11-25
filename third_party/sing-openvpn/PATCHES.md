@@ -67,3 +67,18 @@ initial attempt on failure, no redial after an established session is closed, an
 automatic retry with the default false value. The static-key fixture allows this
 lifecycle test to run without certificates or a remote VPN server; callback
 selection itself is covered separately by the authentication tests.
+
+## Reconnect stability and observability
+
+The supervisor retains its 1–60 second exponential base, but resets it only after
+an established session lasts at least 60 seconds. Actual delays use ±20% jitter,
+capped at 60 seconds locally. Server TEMP backoff is applied afterwards as a lower
+bound and does not inflate the local exponential base. Context cancellation,
+terminal authentication classification and manual reconnect suppression remain.
+
+`Client.ReconnectStatus()` returns a synchronized value snapshot with attempts,
+retries, successful reconnects, consecutive failures and the scheduled next
+attempt. LastError contains only a fixed category, never authentication content.
+`client_supervisor_test.go` exercises consecutive short sessions over net.Pipe,
+stability thresholds, jitter bounds, server backoff and cancellation. Exact timing
+and network-detection limits are documented in `RECONNECT_BEHAVIOR.zh-CN.md`.
